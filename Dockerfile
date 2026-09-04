@@ -19,7 +19,7 @@ RUN mkdir -p src templates \
 fn main() {
     let _ = std::collections::HashMap::<String, String>::new();
     // touch each crate so the linker step is non-trivial
-    fn _axum() { let _: fn() = axum::serve; }
+    fn _axum() { let _ = std::any::type_name::<axum::Router>(); }
     fn _tokio() { let _ = tokio::runtime::Runtime::new().unwrap(); }
     fn _reqwest() { let _ = reqwest::Client::new(); }
     fn _handlebars() { let _ = handlebars::Handlebars::new(); }
