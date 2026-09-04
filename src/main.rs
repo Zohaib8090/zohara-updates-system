@@ -651,7 +651,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     if let Err(e) = s.gh.upload_asset(&release.upload_url, "zohara.db", &new_db).await {
         return err_page(&format!("upload zohara.db: {e:#}"));
     }
-    if let Err(e) = s.gh.upload_asset(&release.upload_url, &art.name, &pkg_bytes).await {
+    if let Err(e) = s.gh.upload_asset(&release.upload_url, &pkg_name, &pkg_upload_bytes).await {
         return err_page(&format!("upload pkg: {e:#}"));
     }
 
