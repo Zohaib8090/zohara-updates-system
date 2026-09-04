@@ -611,7 +611,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         Err(e) => return err_page(&format!("list release assets: {e:#}")),
     };
     let db_asset = assets.iter().find(|a| a.name == "zohara.db").cloned();
-    let pkg_asset = assets.iter().find(|a| a.name == art.name).cloned();
+    let pkg_asset = assets.iter().find(|a| a.name == pkg_name).cloned();
 
     // 5. Run repo-add to add the package to the local db
     let out = match std::process::Command::new("repo-add")
@@ -648,6 +648,10 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     }
 
     // 7. Upload the new db and the new package
+    let pkg_upload_bytes = match std::fs::read(&pkg_path) {
+        Ok(b) => b,
+        Err(e) => return err_page(&format!("read pkg for upload: {e}")),
+    };
     if let Err(e) = s.gh.upload_asset(&release.upload_url, "zohara.db", &new_db).await {
         return err_page(&format!("upload zohara.db: {e:#}"));
     }
@@ -656,7 +660,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     }
 
     // 8. Update apps.json in the package repo
-    if let Err(e) = update_apps_json(&s.gh, &pkg_repo.0, &pkg_repo.1, &art.name).await {
+    if let Err(e) = update_apps_json(&s.gh, &pkg_repo.0, &pkg_repo.1, &pkg_name).await {
         log::warn!("apps.json update skipped: {e:#}");
     }
 
