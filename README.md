@@ -1,4 +1,4 @@
-# zohara-hub
+# zohara-updates-system
 
 Tiny Rust web dashboard that watches our package-building repos
 (`zohara-settings`, `zohara-store`, `zohara-apps`) and lets you
@@ -17,7 +17,7 @@ No database, no persistent state — every page is a fresh GET.
 
 ```bash
 export ZOHARA_HUB_APP_ID=123456
-export ZOHARA_HUB_APP_PRIVATE_KEY="$(cat ~/Downloads/zohara-hub.2026-09-04.private-key.pem)"
+export ZOHARA_HUB_APP_PRIVATE_KEY="$(cat ~/Downloads/zohara-updates-system.2026-09-04.private-key.pem)"
 export ZOHARA_HUB_INSTALLATION_ID=78901234
 cargo run --release
 ```
@@ -39,8 +39,8 @@ Open http://localhost:8080.
 ## GitHub App setup (one-time)
 
 1. https://github.com/settings/apps/new — create a new GitHub App:
-   - Name: `zohara-hub`
-   - Homepage: `https://zohara-hub.onrender.com`
+   - Name: `zohara-updates-system`
+   - Homepage: `https://zohara-updates-system.onrender.com`
    - Webhook: **disabled** (we don't receive webhooks)
    - Repository permissions:
      - **Contents**: Read & write (to commit `apps.json`)
