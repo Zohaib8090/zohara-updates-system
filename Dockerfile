@@ -1,4 +1,4 @@
-FROM rust:1.81-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 WORKDIR /app
 
 # Build toolchain: reqwest (default features) needs OpenSSL headers, and
