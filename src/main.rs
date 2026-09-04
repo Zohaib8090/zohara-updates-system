@@ -215,6 +215,25 @@ impl Gh {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// Like `get_bytes` but uses the vnd.github+json Accept header.
+    /// Required for artifact zip downloads — the redirected S3 endpoint
+    /// rejects `Accept: application/octet-stream` with 415.
+    async fn get_bytes_json_accept(&self, url: &str) -> Result<Vec<u8>> {
+        let auth = self.auth_header().await?;
+        let resp = self
+            .client
+            .get(url)
+            .header("Authorization", auth)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "zohara-updates-system")
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("GET {url} non-2xx"))?;
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     async fn put_json<B: Serialize, T: for<'de> Deserialize<'de>>(
         &self,
         url: &str,
@@ -541,7 +560,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     };
 
     // 2. Download the artifact (it's a zip wrapping the .pkg.tar.zst)
-    let zip_bytes = match s.gh.get_bytes(&art.archive_download_url).await {
+    let zip_bytes = match s.gh.get_bytes_json_accept(&art.archive_download_url).await {
         Ok(x) => x,
         Err(e) => return err_page(&format!("download artifact: {e:#}")),
     };
