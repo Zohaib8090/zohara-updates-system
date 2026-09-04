@@ -30,10 +30,6 @@
       <a href="{{ repo.html_url }}">github</a></div>
   </div>
 
-  {% if let Some(e) = err %}
-  <div class="err">{{ e }}</div>
-  {% endif %}
-
   <h2>Recent successful runs</h2>
   {% if runs.is_empty() %}
   <p class="meta">No successful runs yet.</p>
