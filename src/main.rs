@@ -439,9 +439,10 @@ fn err_page(msg: &str) -> Response {
 }
 
 fn render_html<T: Template>(t: T) -> Response {
-    t.render()
-        .map(|b| Html(b).into_response())
-        .unwrap_or_else(|e| err_page(&format!("template error: {e}")))
+    match t.render() {
+        Ok(b) => Html(b).into_response(),
+        Err(e) => err_page(&format!("template error: {e}")),
+    }
 }
 
 async fn index(State(s): State<AppState>) -> Response {
@@ -536,13 +537,15 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         Ok(x) => x,
         Err(e) => return err_page(&format!("list artifacts: {e:#}")),
     };
-    let art = arts
+        let art = match arts
         .artifacts
         .into_iter()
         .find(|a| a.name.ends_with(".pkg.tar.zst"))
-        .unwrap_or_else(|| return err_page("no .pkg.tar.zst artifact on this run"));
-
-    // 2. Download
+    {
+        Some(x) => x,
+        None => return err_page("no .pkg.tar.zst artifact on this run"),
+    };
+// 2. Download
     let pkg_bytes = match s.gh.get_bytes(&art.archive_download_url).await {
         Ok(x) => x,
         Err(e) => return err_page(&format!("download artifact: {e:#}")),
