@@ -523,7 +523,10 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     }
     let pkg_repo = (s.cfg.pkg_repo.0.clone(), s.cfg.pkg_repo.1.clone());
 
-    // 1. List the run's artifacts
+    // 1. List the run's artifacts. We accept ANY artifact (not just one
+    //    named *.pkg.tar.zst) because some workflows upload a generic
+    //    name like "zohara-settings-arch-x86_64" containing the package
+    //    inside as a zip.
     let arts_url = format!(
         "https://api.github.com/repos/{owner}/{name}/actions/runs/{}/artifacts",
         f.run_id
@@ -532,16 +535,13 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         Ok(x) => x,
         Err(e) => return err_page(&format!("list artifacts: {e:#}")),
     };
-        let art = match arts
-        .artifacts
-        .into_iter()
-        .find(|a| a.name.ends_with(".pkg.tar.zst"))
-    {
+    let art = match arts.artifacts.into_iter().next() {
         Some(x) => x,
-        None => return err_page("no .pkg.tar.zst artifact on this run"),
+        None => return err_page("no artifacts on this run"),
     };
-// 2. Download
-    let pkg_bytes = match s.gh.get_bytes(&art.archive_download_url).await {
+
+    // 2. Download the artifact (it's a zip wrapping the .pkg.tar.zst)
+    let zip_bytes = match s.gh.get_bytes(&art.archive_download_url).await {
         Ok(x) => x,
         Err(e) => return err_page(&format!("download artifact: {e:#}")),
     };
@@ -550,10 +550,46 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     if let Err(e) = std::fs::create_dir_all(&work) {
         return err_page(&format!("mkdir work: {e}"));
     }
-    let pkg_path = work.join(&art.name);
-    if let Err(e) = std::fs::write(&pkg_path, &pkg_bytes) {
-        return err_page(&format!("write pkg: {e}"));
+    let zip_path = work.join("artifact.zip");
+    if let Err(e) = std::fs::write(&zip_path, &zip_bytes) {
+        return err_page(&format!("write zip: {e}"));
     }
+
+    // 3. Unzip and locate the .pkg.tar.zst inside
+    let extract = work.join("extract");
+    std::fs::create_dir_all(&extract).ok();
+    let zip_status = std::process::Command::new("unzip")
+        .arg("-o")
+        .arg(&zip_path)
+        .arg("-d")
+        .arg(&extract)
+        .output();
+    let zip_ok = match zip_status {
+        Ok(o) if o.status.success() => true,
+        _ => false,
+    };
+    if !zip_ok {
+        return err_page("artifact is not a zip (no `unzip` or invalid format)");
+    }
+    let pkg_path = match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("find {} -type f -name '*.pkg.tar.zst' | head -1", extract.display()))
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if p.is_empty() {
+                return err_page("no .pkg.tar.zst found inside artifact zip");
+            }
+            std::path::PathBuf::from(p)
+        }
+        _ => return err_page("find .pkg.tar.zst failed"),
+    };
+    let pkg_name = pkg_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("package.pkg.tar.zst")
+        .to_string();
 
     // 3. Get/create the channel release
     let tag = if channel == "stable" {
