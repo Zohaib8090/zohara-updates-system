@@ -635,7 +635,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     // 5. Run repo-add to add the package to the local db
     let out = match std::process::Command::new("repo-add")
         .current_dir(&work)
-        .arg("zohara.db")
+        .arg("zohara")
         .arg(&pkg_path)
         .output() {
         Ok(o) => o,
