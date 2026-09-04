@@ -22,7 +22,7 @@ fn main() {
     fn _axum() { let _ = std::any::type_name::<axum::Router>(); }
     fn _tokio() { let _ = tokio::runtime::Runtime::new().unwrap(); }
     fn _reqwest() { let _ = reqwest::Client::new(); }
-    fn _askama() { let _ = askama::Template::EXT_NAME; }
+    fn _askama() { let _ = askama::Template::render; }
     fn _jsonwebtoken() { use jsonwebtoken::{EncodingKey, Header}; let _ = EncodingKey::from_secret(b""); let _ = Header::default(); }
     fn _base64() { use base64::Engine; let _ = base64::engine::general_purpose::STANDARD.encode(&[]); }
     fn _serde() { let _ = serde_json::json!({}); }
