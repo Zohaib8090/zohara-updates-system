@@ -211,6 +211,26 @@ impl Gh {
         std::fs::write(dest, &bytes)?;
         Ok(())
     }
+
+    async fn put_json<B: Serialize, T: for'de Deserialize<'de>>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T> {
+        let token = self.app.token().await?;
+        let resp = self
+            .client
+            .put(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?
+            .error_for_status()
+            .with_context(|| format!("PUT {url} non-2xx"))?;
+        Ok(resp.json().await?)
+    }
 }
 
 // ── Domain types ─────────────────────────────────────────────────────────
