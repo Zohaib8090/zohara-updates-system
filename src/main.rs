@@ -513,18 +513,17 @@ async fn publish(
     State(s): State<AppState>,
     Form(f): Form<PublishForm>,
 ) -> Response {
-    do_publish(s, f).await.unwrap_or_else(|e| err_page(&e))
+    do_publish(s, f).await
 }
 
-async fn do_publish(s: AppState, f: PublishForm) -> std::result::Result<Redirect, String> {
-    let (owner, name) = f
-        .repo
-        .split_once('/')
-        .ok_or_else(|| "repo must be owner/name".to_string())?
-        .to_owned();
+async fn do_publish(s: AppState, f: PublishForm) -> Response {
+    let (owner, name) = match f.repo.split_once('/') {
+        Some(p) => p.to_owned(),
+        None => return err_page("repo must be owner/name"),
+    };
     let channel = f.channel.to_lowercase();
     if !["stable", "beta", "alpha"].contains(&channel.as_str()) {
-        return Err(format!("invalid channel: {channel}"));
+        return err_page(&format!("invalid channel: {channel}"));
     }
     let pkg_repo = (s.cfg.pkg_repo.0.clone(), s.cfg.pkg_repo.1.clone());
 
@@ -537,24 +536,24 @@ async fn do_publish(s: AppState, f: PublishForm) -> std::result::Result<Redirect
         .gh
         .get_json(&arts_url)
         .await
-        .map_err(|e| format!("list artifacts: {e:#}"))?;
+        .unwrap_or_else(|e| return err_page(&format!("list artifacts: {e:#}")));
     let art = arts
         .artifacts
         .into_iter()
         .find(|a| a.name.ends_with(".pkg.tar.zst"))
-        .ok_or_else(|| "no .pkg.tar.zst artifact on this run".to_string())?;
+        .unwrap_or_else(|| return err_page("no .pkg.tar.zst artifact on this run"));
 
     // 2. Download
     let pkg_bytes = s
         .gh
         .get_bytes(&art.archive_download_url)
         .await
-        .map_err(|e| format!("download artifact: {e:#}"))?;
+        .unwrap_or_else(|e| return err_page(&format!("download artifact: {e:#}")));
     let work = env::temp_dir().join(format!("zohara-pub-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| format!("mkdir work: {e}"))?;
+    std::fs::create_dir_all(&work).unwrap_or_else(|e| return err_page(&format!("mkdir work: {e}")));
     let pkg_path = work.join(&art.name);
-    std::fs::write(&pkg_path, &pkg_bytes).map_err(|e| format!("write pkg: {e}"))?;
+    std::fs::write(&pkg_path, &pkg_bytes).unwrap_or_else(|e| return err_page(&format!("write pkg: {e}")));
 
     // 3. Get/create the channel release
     let tag = if channel == "stable" {
@@ -564,7 +563,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> std::result::Result<Redirect
     };
     let release = ensure_release(&s.gh, &pkg_repo.0, &pkg_repo.1, &tag, &channel)
         .await
-        .map_err(|e| format!("ensure release: {e:#}"))?;
+        .unwrap_or_else(|e| return err_page(&format!("ensure release: {e:#}")));
 
     // 4. Find existing zohara.db asset (if any) and replace it
     let assets: Vec<ReleaseAsset> = s
@@ -574,7 +573,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> std::result::Result<Redirect
             pkg_repo.0, pkg_repo.1, release.id
         ))
         .await
-        .map_err(|e| format!("list release assets: {e:#}"))?;
+        .unwrap_or_else(|e| return err_page(&format!("list release assets: {e:#}")));
     let db_asset = assets.iter().find(|a| a.name == "zohara.db").cloned();
     let pkg_asset = assets.iter().find(|a| a.name == art.name).cloned();
 
@@ -584,29 +583,29 @@ async fn do_publish(s: AppState, f: PublishForm) -> std::result::Result<Redirect
         .arg("zohara.db")
         .arg(&pkg_path)
         .output()
-        .map_err(|e| format!("repo-add: {e}"))?;
+        .unwrap_or_else(|e| return err_page(&format!("repo-add: {e}")));
     if !out.status.success() {
-        return Err(format!(
+        return err_page(&format!(
             "repo-add failed: {}",
             String::from_utf8_lossy(&out.stderr)
         ));
     }
     let new_db = std::fs::read(work.join("zohara.db"))
-        .map_err(|e| format!("read new zohara.db: {e}"))?;
+        .unwrap_or_else(|e| return err_page(&format!("read new zohara.db: {e}")));
 
     // 6. Delete old assets (so we can re-upload with same name)
     if let Some(a) = &db_asset {
         s.gh
             .delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id)
             .await
-            .map_err(|e| format!("delete old zohara.db: {e:#}"))?;
+            .unwrap_or_else(|e| return err_page(&format!("delete old zohara.db: {e:#}")));
     }
     if let Some(a) = &pkg_asset {
         if pkg_asset.as_ref().map(|x| x.id) != db_asset.as_ref().map(|x| x.id) {
             s.gh
                 .delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id)
                 .await
-                .map_err(|e| format!("delete old pkg: {e:#}"))?;
+                .unwrap_or_else(|e| return err_page(&format!("delete old pkg: {e:#}")));
         }
     }
 
@@ -614,18 +613,18 @@ async fn do_publish(s: AppState, f: PublishForm) -> std::result::Result<Redirect
     s.gh
         .upload_asset(&release.upload_url, "zohara.db", &new_db)
         .await
-        .map_err(|e| format!("upload zohara.db: {e:#}"))?;
+        .unwrap_or_else(|e| return err_page(&format!("upload zohara.db: {e:#}")));
     s.gh
         .upload_asset(&release.upload_url, &art.name, &pkg_bytes)
         .await
-        .map_err(|e| format!("upload pkg: {e:#}"))?;
+        .unwrap_or_else(|e| return err_page(&format!("upload pkg: {e:#}")));
 
     // 8. Update apps.json in the package repo
     if let Err(e) = update_apps_json(&s.gh, &pkg_repo.0, &pkg_repo.1, &art.name).await {
         log::warn!("apps.json update skipped: {e:#}");
     }
 
-    Ok(Redirect::to(&format!("/repo/{owner}/{name}")))
+    Redirect::to(&format!("/repo/{owner}/{name}")).into_response()
 }
 
 async fn ensure_release(
