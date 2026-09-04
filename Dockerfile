@@ -41,7 +41,7 @@ RUN touch src/main.rs && cargo build --release
 # Arch Linux base image ships pacman natively.
 FROM archlinux:latest
 RUN pacman -Syu --noconfirm \
-    && pacman -S --noconfirm --needed ca-certificates \
+    && pacman -S --noconfirm --needed ca-certificates unzip \
     && pacman -Scc --noconfirm
 WORKDIR /app
 COPY --from=builder /app/target/release/zohara-updates-system /usr/local/bin/zohara-updates-system
