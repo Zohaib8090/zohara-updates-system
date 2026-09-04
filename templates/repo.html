@@ -44,7 +44,7 @@
       <a href="{{ r.html_url }}">{{ r.display_title }}</a>
     </div>
     <div class="run-meta">
-      #{{ r.id }} · {{ r.head_branch }}@{{ r.head_sha | truncate(length=7, end="") }}
+      #{{ r.id }} · {{ r.head_branch }}@{{ r.head_sha[..7] }}
       · {{ r.created_at }} · {{ r.name }}
     </div>
     <form method="post" action="/publish">
