@@ -57,7 +57,6 @@ impl AppConfig {
         let owner = env::var("ZOHARA_HUB_OWNER").unwrap_or_else(|_| "Zohaib8090".into());
         let watched = vec![
             (owner.clone(), "zohara-settings".into()),
-            (owner.clone(), "zohara-store".into()),
             (owner.clone(), "zohara-apps".into()),
         ];
         let pkg_repo = (
@@ -460,11 +459,7 @@ async fn index(State(s): State<AppState>) -> Response {
                 html_url: format!("https://github.com/{owner}/{name}"),
             }),
             Err(e) => {
-                return render_html(IndexTpl {
-                    title: "zohara-updates-system",
-                    repos: &[],
-                    err: Some(&format!("failed to list {owner}/{name}: {e}")),
-                });
+                log::warn!("skip {owner}/{name}: {e}");
             }
         }
     }
