@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>zohara-hub</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #1e1e2e; color: #cdd6f4;
+      margin: 0; padding: 24px; max-width: 1200px; margin: 0 auto;
+    }
+    h1 { color: #89b4fa; }
+    h2 { color: #a6e3a1; margin-top: 32px; border-bottom: 1px solid #45475a; padding-bottom: 8px; }
+    a { color: #89b4fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .repo { background: #313244; border: 1px solid #45475a; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .repo-header { display: flex; justify-content: space-between; align-items: center; }
+    .pkg { color: #cba6f7; font-size: 12px; background: #1e1e2e; padding: 2px 8px; border-radius: 4px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #313244; }
+    th { color: #a6adc8; font-weight: normal; font-size: 12px; }
+    .status-success { color: #a6e3a1; }
+    .status-failure { color: #f38ba8; }
+    .empty { color: #6c7086; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>zohara-hub</h1>
+  <p>Watch these repos. Click a repo to see the recent successful builds, then "Publish" to push the artifact to one of the OTA channels in <code>zohara-packages</code>.</p>
+
+  {{#each rows}}
+  <div class="repo">
+    <div class="repo-header">
+      <h2 style="border:none; margin:0;"><a href="/repo/{{repo}}">{{repo}}</a></h2>
+      <span class="pkg">package: {{package}}</span>
+    </div>
+    {{#if runs.length}}
+    <table>
+      <tr><th>Workflow</th><th>Branch</th><th>Status</th><th>When</th></tr>
+      {{#each runs}}
+      <tr>
+        <td><a href="{{html_url}}">{{display_title}}</a></td>
+        <td><code>{{head_branch}}</code></td>
+        <td><span class="status-{{conclusion}}">{{conclusion}}</span></td>
+        <td>{{created_at}}</td>
+      </tr>
+      {{/each}}
+    </table>
+    {{else}}
+    <p class="empty">no successful runs yet</p>
+    {{/if}}
+  </div>
+  {{/each}}
+</body>
+</html>

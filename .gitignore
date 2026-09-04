@@ -1,0 +1,13 @@
+# Build artifacts
+target/
+**/*.rs.bk
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local secrets (Render sets these via the dashboard, not via a .env file)
+.env
+.env.local
