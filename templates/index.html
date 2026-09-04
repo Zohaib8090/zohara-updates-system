@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ title }}</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+           background:#0d1117; color:#c9d1d9; margin:0; padding:2rem; }
+    a { color:#58a6ff; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    h1 { font-weight:500; }
+    .grid { display:grid; gap:1rem; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); }
+    .card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1rem; }
+    .name { font-size:1.1rem; font-weight:600; }
+    .desc { color:#8b949e; font-size:0.9rem; margin:0.4rem 0; }
+    .meta { color:#8b949e; font-size:0.85rem; }
+    .err { background:#3d1d1d; border:1px solid #f85149; padding:1rem; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <h1>{{ title }}</h1>
+  <p>Watched package repos. Click to view recent builds and publish.</p>
+  {% if let Some(e) = err %}
+  <div class="err">{{ e }}</div>
+  {% endif %}
+  <div class="grid">
+    {% for r in repos %}
+    <a class="card" href="/repo/{{ r.owner }}/{{ r.name }}">
+      <div class="name">{{ r.full }}</div>
+      <div class="desc">{{ r.description }}</div>
+      <div class="meta">★ {{ r.stars }} · issues {{ r.issues }}</div>
+    </a>
+    {% endfor %}
+  </div>
+</body>
+</html>

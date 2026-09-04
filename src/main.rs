@@ -1,173 +1,197 @@
-// Zohara Hub — a small web dashboard that watches our package-building
-// repos and lets us re-publish their artifacts to the OTA channel
-// releases in Zohaib8090/zohara-packages with one click.
+// Zohara Updates System — tiny web dashboard that watches our
+// package-building repos (zohara-settings, zohara-store, zohara-apps)
+// and lets you re-publish their latest successful build artifact to
+// the OTA channel release in Zohaib8090/zohara-packages.
 //
-// Why this exists: replace the broken cross-repo GitHub Actions
-// dispatch loop with a simple "GET → publish" web tool. We don't
-// need a database — every page request hits the GitHub REST API
-// directly, so the dashboard is always in sync with reality.
+// Stack: Rust 1.88, axum 0.7, reqwest 0.12 (rustls), askama 0.12,
+// jsonwebtoken 9, base64 0.22, serde, tokio, log.
 //
-// Routes:
-//   GET  /                       — list all watched repos + their
-//                                  recent successful workflow runs
-//   GET  /repo/{owner}/{name}    — single-repo view (the page that
-//                                  shows the "Publish" button per run)
-//   POST /publish                — do the publish: download artifact
-//                                  → repo-add → upload to release →
-//                                  commit apps.json
+// Auth: GitHub App. The app is installed on the watched repos with
+// contents:read and on zohara-packages with contents:write. We mint a
+// short-lived JWT, exchange it for an installation token, and use
+// that to call the GitHub REST API.
 //
-// Auth: the GitHub App's installation token is held in env
-// (ZOHARA_HUB_APP_ID + ZOHARA_HUB_APP_PRIVATE_KEY +
-// ZOHARA_HUB_INSTALLATION_ID). The page is otherwise open — Render
-// free's URL is hard to guess but I trust the model's threat model
-// for now (you can put it behind a password later if you want).
+// Endpoints:
+//   GET  /                          list watched repos + recent runs
+//   GET  /repo/{owner}/{name}       single-repo view + publish buttons
+//   POST /publish                   do the publish (download -> repo-add -> upload)
+//
+// State: none. All authoritative state is GitHub.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use askama::Template;
 use axum::{
     extract::{Form, Path, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
-    Router, Server,
+    Router,
 };
-use chrono::{DateTime, Utc};
-use handlebars::Handlebars;
+use base64::Engine;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
+use tokio::sync::RwLock;
 
-// ── Configuration ────────────────────────────────────────────────────────
+// ── App config from env vars ────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 struct AppConfig {
-    /// Source repos the dashboard watches, with the package name each
-    /// of their artifacts produces. (Same package name across repos
-    /// is fine — they're independent.)
-    sources: Vec<WatchedSource>,
+    app_id: u64,
+    installation_id: u64,
+    private_key_pem: String,
+    watched_repos: Vec<(String, String)>, // (owner, name)
+    pkg_repo: (String, String),           // (owner, name)
 }
 
-#[derive(Clone, Debug)]
-struct WatchedSource {
-    /// "owner/name" on GitHub
-    repo: String,
-    /// The package name this repo produces (e.g. "zohara-settings").
-    package: String,
-    /// The arch the workflow builds for (so we can pick the right asset).
-    arch: &'static str,
+impl AppConfig {
+    fn from_env() -> Result<Self> {
+        let app_id: u64 = require_env("ZOHARA_HUB_APP_ID")?
+            .parse()
+            .context("ZOHARA_HUB_APP_ID is not a number")?;
+        let installation_id: u64 = require_env("ZOHARA_HUB_INSTALLATION_ID")?
+            .parse()
+            .context("ZOHARA_HUB_INSTALLATION_ID is not a number")?;
+        let private_key_pem =
+            require_env("ZOHARA_HUB_APP_PRIVATE_KEY")?.replace("\\n", "\n");
+        let owner = env::var("ZOHARA_HUB_OWNER").unwrap_or_else(|_| "Zohaib8090".into());
+        let watched = vec![
+            (owner.clone(), "zohara-settings".into()),
+            (owner.clone(), "zohara-store".into()),
+            (owner.clone(), "zohara-apps".into()),
+        ];
+        let pkg_repo = (
+            env::var("ZOHARA_HUB_PKG_OWNER").unwrap_or_else(|_| owner.clone()),
+            env::var("ZOHARA_HUB_PKG_REPO")
+                .unwrap_or_else(|_| "zohara-packages".into()),
+        );
+        Ok(Self {
+            app_id,
+            installation_id,
+            private_key_pem,
+            watched_repos: watched,
+            pkg_repo,
+        })
+    }
 }
 
-// ── GitHub App auth ──────────────────────────────────────────────────────
+fn require_env(name: &str) -> Result<String> {
+    env::var(name).with_context(|| format!("{name} not set"))
+}
+
+// ── GitHub App auth ─────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct GithubAppClaims {
+    iat: i64,
+    exp: i64,
+    iss: String,
+}
 
 #[derive(Clone)]
-struct GhApp {
-    app_id: String,
-    private_key_pem: String,
-    installation_id: String,
-    /// Cached installation token. GitHub installation tokens are good
-    /// for 1 hour, so we refresh them well before that.
-    cached_token: Arc<tokio::sync::RwLock<Option<CachedToken>>>,
+struct AppAuth {
+    app_id: u64,
+    installation_id: u64,
+    pem: String,
+    client: reqwest::Client,
+    cache: Arc<RwLock<Option<(String, std::time::Instant)>>>,
 }
 
-struct CachedToken {
-    token: String,
-    expires_at: DateTime<Utc>,
-}
+impl AppAuth {
+    fn new(app_id: u64, installation_id: u64, pem: String) -> Self {
+        Self {
+            app_id,
+            installation_id,
+            pem,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            cache: Arc::new(RwLock::new(None)),
+        }
+    }
 
-impl GhApp {
+    fn mint_jwt(&self) -> Result<String> {
+        let now = chrono::Utc::now().timestamp();
+        let claims = GithubAppClaims {
+            iat: now - 60,
+            exp: now + 9 * 60,
+            iss: self.app_id.to_string(),
+        };
+        let key = EncodingKey::from_rsa_pem(self.pem.as_bytes())
+            .context("invalid ZOHARA_HUB_APP_PRIVATE_KEY")?;
+        let header = Header::new(Algorithm::RS256);
+        Ok(encode(&header, &claims, &key)?)
+    }
+
     async fn token(&self) -> Result<String> {
-        // Reuse if fresh.
-        if let Some(c) = self.cached_token.read().await.as_ref() {
-            if c.expires_at > Utc::now() + chrono::Duration::minutes(5) {
-                return Ok(c.token.clone());
+        {
+            let r = self.cache.read().await;
+            if let Some((tok, when)) = r.as_ref() {
+                if when.elapsed() < Duration::from_secs(50 * 60) {
+                    return Ok(tok.clone());
+                }
             }
         }
-
-        // Mint a new JWT signed with the app's private key.
-        let jwt = mint_jwt(&self.app_id, &self.private_key_pem)?;
-        // Exchange the JWT for an installation token.
-        let client = reqwest::Client::new();
+        let jwt = self.mint_jwt()?;
         let url = format!(
             "https://api.github.com/app/installations/{}/access_tokens",
             self.installation_id
         );
-        let resp = client
+        let resp: serde_json::Value = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", jwt))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "zohara-hub")
+            .header("User-Agent", "zohara-updates-system")
             .send()
             .await
-            .context("exchange JWT for installation token")?
-            .error_for_status()?
-            .json::<TokenResponse>()
-            .await
-            .context("parse installation token response")?;
-
-        let token = resp.token.clone();
-        let expires_at = Utc::now() + chrono::Duration::seconds(
-            (resp.expires_at.timestamp() - Utc::now().timestamp()).max(60),
-        );
-        *self.cached_token.write().await = Some(CachedToken {
-            token: token.clone(),
-            expires_at,
-        });
+            .context("POST installations/access_tokens")?
+            .error_for_status()
+            .context("installations/access_tokens non-2xx")?
+            .json()
+            .await?;
+        let token = resp
+            .get("token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("no `token` in installation response"))?
+            .to_string();
+        *self.cache.write().await = Some((token.clone(), std::time::Instant::now()));
         Ok(token)
     }
 }
 
-#[derive(Deserialize)]
-struct TokenResponse {
-    token: String,
-    #[serde(rename = "expires_at")]
-    expires_at: DateTime<Utc>,
-}
-
-// Build a short-lived GitHub App JWT.
-// Format: {"iat":..., "exp":..., "iss":<app_id>}, signed RS256.
-fn mint_jwt(app_id: &str, private_key_pem: &str) -> Result<String> {
-    use jsonwebtoken::{Algorithm, EncodingKey, Header};
-    let now = Utc::now().timestamp();
-    let exp = now + 9 * 60; // 9 minutes, GitHub requires <10
-    let claims = serde_json::json!({
-        "iat": now,
-        "exp": exp,
-        "iss": app_id,
-    });
-    let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
-        .context("parse RSA private key")?;
-    let token = jsonwebtoken::encode(
-        &Header::new(Algorithm::RS256),
-        &claims,
-        &key,
-    )?;
-    Ok(token)
-}
-
-// ── GitHub API helpers ───────────────────────────────────────────────────
+// ── GitHub REST helpers ─────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct Gh {
-    app: GhApp,
+    auth: AppAuth,
     client: reqwest::Client,
 }
 
 impl Gh {
-    fn new(app: GhApp) -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("zohara-hub")
-            .build()
-            .expect("build reqwest client");
-        Self { app, client }
+    fn new(auth: AppAuth) -> Self {
+        Self {
+            auth,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap(),
+        }
+    }
+
+    async fn auth_header(&self) -> Result<String> {
+        Ok(format!("Bearer {}", self.auth.token().await?))
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T> {
-        let token = self.app.token().await?;
+        let auth = self.auth_header().await?;
         let resp = self
             .client
             .get(url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", auth)
             .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "zohara-updates-system")
             .send()
             .await
             .with_context(|| format!("GET {url}"))?
@@ -176,53 +200,34 @@ impl Gh {
         Ok(resp.json().await?)
     }
 
-    async fn post_json<B: Serialize, T: for<'de> Deserialize<'de>>(
-        &self,
-        url: &str,
-        body: &B,
-    ) -> Result<T> {
-        let token = self.app.token().await?;
+    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let auth = self.auth_header().await?;
         let resp = self
             .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .json(body)
+            .get(url)
+            .header("Authorization", auth)
+            .header("Accept", "application/octet-stream")
+            .header("User-Agent", "zohara-updates-system")
             .send()
             .await
-            .with_context(|| format!("POST {url}"))?
+            .with_context(|| format!("GET {url}"))?
             .error_for_status()
-            .with_context(|| format!("POST {url} non-2xx"))?;
-        Ok(resp.json().await?)
+            .with_context(|| format!("GET {url} non-2xx"))?;
+        Ok(resp.bytes().await?.to_vec())
     }
 
-    async fn download_to_file(&self, url: &str, dest: &std::path::Path) -> Result<()> {
-        let token = self.app.token().await?;
-        let bytes = self
-            .client
-            .get(url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/octet-stream")
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
-        std::fs::write(dest, &bytes)?;
-        Ok(())
-    }
-
-    async fn put_json<B: Serialize, T: for'de Deserialize<'de>>(
+    async fn put_json<B: Serialize, T: for<'de> Deserialize<'de>>(
         &self,
         url: &str,
         body: &B,
     ) -> Result<T> {
-        let token = self.app.token().await?;
+        let auth = self.auth_header().await?;
         let resp = self
             .client
             .put(url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", auth)
             .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "zohara-updates-system")
             .json(body)
             .send()
             .await
@@ -231,9 +236,73 @@ impl Gh {
             .with_context(|| format!("PUT {url} non-2xx"))?;
         Ok(resp.json().await?)
     }
+
+    async fn delete(&self, url: &str) -> Result<()> {
+        let auth = self.auth_header().await?;
+        self.client
+            .delete(url)
+            .header("Authorization", auth)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "zohara-updates-system")
+            .send()
+            .await
+            .with_context(|| format!("DELETE {url}"))?
+            .error_for_status()
+            .with_context(|| format!("DELETE {url} non-2xx"))?;
+        Ok(())
+    }
+
+    async fn upload_asset(
+        &self,
+        release_upload_url: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let base = release_upload_url.split('?').next().unwrap_or(release_upload_url);
+        let url = format!("{base}?name={}", urlencode(name));
+        let auth = self.auth_header().await?;
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", auth)
+            .header("Accept", "application/vnd.github+json")
+            .header("Content-Type", "application/octet-stream")
+            .header("User-Agent", "zohara-updates-system")
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let s = resp.status();
+        if s.as_u16() == 422 {
+            bail!("asset `{name}` already exists on this release (HTTP 422)");
+        }
+        if !s.is_success() {
+            let t = resp.text().await.unwrap_or_default();
+            bail!("upload asset `{name}`: HTTP {s} {t}");
+        }
+        Ok(())
+    }
+
+    async fn delete_asset_by_id(&self, owner: &str, name: &str, asset_id: u64) -> Result<()> {
+        self.delete(&format!(
+            "https://api.github.com/repos/{owner}/{name}/releases/assets/{asset_id}"
+        ))
+        .await
+    }
 }
 
-// ── Domain types ─────────────────────────────────────────────────────────
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+// ── Domain types ────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct WorkflowRuns {
@@ -243,24 +312,24 @@ struct WorkflowRuns {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct WorkflowRun {
     id: u64,
+    #[serde(default)]
     name: String,
     head_branch: String,
     head_sha: String,
     display_title: String,
-    path: String,
-    conclusion: Option<String>,
     status: String,
+    conclusion: Option<String>,
+    #[serde(default)]
     event: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    created_at: String,
+    updated_at: String,
     html_url: String,
-    artifacts_url: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Artifacts {
     artifacts: Vec<Artifact>,
-    total_count: u32,
+    total_count: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -277,517 +346,415 @@ struct Release {
     id: u64,
     tag_name: String,
     name: String,
-    prerelease: bool,
     upload_url: String,
     html_url: String,
-    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RepoInfo {
+    full_name: String,
+    description: Option<String>,
+    stargazers_count: u64,
+    open_issues_count: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ReleaseAsset {
     id: u64,
     name: String,
-    size: u64,
-    state: String,
+    url: String,
     browser_download_url: String,
+    size: u64,
 }
 
-// ── Handlers ────────────────────────────────────────────────────────────
-
-async fn index(State(state): State<AppState>) -> impl IntoResponse {
-    let gh = &state.gh;
-
-    // Per source repo: fetch the latest 5 successful runs.
-    let mut rows: Vec<RepoRow> = Vec::new();
-    for src in &state.config.sources {
-        let url = format!(
-            "https://api.github.com/repos/{}/actions/runs?per_page=5&status=success&conclusion=success",
-            src.repo
-        );
-        let runs = gh
-            .get_json::<WorkflowRuns>(&url)
-            .await
-            .map(|r| r.workflow_runs)
-            .unwrap_or_default();
-        rows.push(RepoRow {
-            repo: src.repo.clone(),
-            package: src.package.clone(),
-            runs: runs.into_iter().take(5).collect(),
-        });
-    }
-
-    let tmpl = state.hbs.render("index", &IndexCtx { rows }).unwrap_or_else(|e| {
-        format!("template error: {e}")
-    });
-    Html(tmpl)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ContentEntry {
+    name: String,
+    path: String,
+    sha: String,
+    download_url: Option<String>,
 }
 
-#[derive(Serialize)]
-struct IndexCtx {
-    rows: Vec<RepoRow>,
+// ── HTML templates (askama) ─────────────────────────────────────────────
+
+#[derive(Template)]
+#[template(path = "index.html")]
+struct IndexTpl<'a> {
+    title: &'a str,
+    repos: &'a [RepoSummary],
+    err: Option<&'a str>,
 }
 
-#[derive(Serialize)]
-struct RepoRow {
-    repo: String,
-    package: String,
-    runs: Vec<WorkflowRun>,
+#[derive(Template)]
+#[template(path = "repo.html")]
+struct RepoTpl<'a> {
+    title: &'a str,
+    repo: &'a RepoSummary,
+    runs: &'a [WorkflowRun],
 }
 
-async fn repo(
-    State(state): State<AppState>,
-    Path((owner, name)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let gh = &state.gh;
-    let repo_full = format!("{owner}/{name}");
-    let source = state
-        .config
-        .sources
-        .iter()
-        .find(|s| s.repo == repo_full)
-        .cloned();
-
-    let Some(source) = source else {
-        return (StatusCode::NOT_FOUND, "Repo not in watch list").into_response();
-    };
-
-    let runs_url = format!(
-        "https://api.github.com/repos/{repo_full}/actions/runs?per_page=10&status=success&conclusion=success"
-    );
-    let runs: Vec<WorkflowRun> = gh
-        .get_json::<WorkflowRuns>(&runs_url)
-        .await
-        .map(|r| r.workflow_runs)
-        .unwrap_or_default();
-
-    // For each run, fetch its artifacts and match the .pkg.tar.zst.
-    let mut run_rows: Vec<RunRow> = Vec::new();
-    for run in &runs {
-        let artifacts_url = format!(
-            "https://api.github.com/repos/{repo_full}/actions/runs/{}/artifacts",
-            run.id
-        );
-        let artifacts = gh
-            .get_json::<Artifacts>(&artifacts_url)
-            .await
-            .map(|a| a.artifacts)
-            .unwrap_or_default();
-        let pkg = artifacts
-            .iter()
-            .find(|a| a.name.ends_with(".pkg.tar.zst"))
-            .cloned();
-        run_rows.push(RunRow {
-            run: run.clone(),
-            artifact: pkg,
-        });
-    }
-
-    let tmpl = state
-        .hbs
-        .render(
-            "repo",
-            &RepoCtx {
-                repo: source.repo.clone(),
-                package: source.package.clone(),
-                arch: source.arch.to_string(),
-                runs: run_rows,
-            },
-        )
-        .unwrap_or_else(|e| format!("template error: {e}"));
-    Html(tmpl).into_response()
+#[derive(Template)]
+#[template(path = "error.html")]
+struct ErrorTpl<'a> {
+    title: &'a str,
+    err: &'a str,
 }
 
-#[derive(Serialize)]
-struct RepoCtx {
-    repo: String,
-    package: String,
-    arch: String,
-    runs: Vec<RunRow>,
+#[derive(Clone, Serialize)]
+struct RepoSummary {
+    owner: String,
+    name: String,
+    full: String,
+    description: String,
+    stars: u64,
+    issues: u64,
+    html_url: String,
 }
 
-#[derive(Serialize)]
-struct RunRow {
-    run: WorkflowRun,
-    artifact: Option<Artifact>,
+// ── App state ───────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct AppState {
+    cfg: Arc<AppConfig>,
+    gh: Gh,
 }
 
 #[derive(Deserialize)]
 struct PublishForm {
     repo: String,
     run_id: u64,
-    channel: String, // "stable" | "beta" | "alpha"
+    channel: String,
 }
 
-async fn publish(
-    State(state): State<AppState>,
-    Form(form): Form<PublishForm>,
-) -> impl IntoResponse {
-    let gh = &state.gh;
-    let pkg_repo = "Zohaib8090/zohara-packages";
+// ── Handlers ────────────────────────────────────────────────────────────
 
-    let source = state
-        .config
-        .sources
-        .iter()
-        .find(|s| s.repo == form.repo)
-        .cloned();
-    let Some(source) = source else {
-        return (StatusCode::NOT_FOUND, "Source repo not in watch list").into_response();
-    };
-
-    let pkg_name = &source.package;
-    let pkg_ver = read_version_from_run(gh, &form.repo, form.run_id).await.unwrap_or_else(|_| "0.0.0".to_string());
-    let pkg_file = format!("{pkg_name}-{pkg_ver}-1-x86_64.pkg.tar.zst");
-
-    // 1. Download the artifact from the source run
-    let artifacts: Artifacts = gh
-        .get_json(&format!(
-            "https://api.github.com/repos/{}/actions/runs/{}/artifacts",
-            form.repo, form.run_id
-        ))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list artifacts: {e}")))?;
-    let artifact = artifacts
-        .artifacts
-        .iter()
-        .find(|a| a.name.ends_with(".pkg.tar.zst"))
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "no .pkg.tar.zst artifact in this run".to_string(),
-            )
-        })
-        .map_err(|e| e)?;
-
-    // We need a fresh download URL because /artifacts/{id}/zip needs auth.
-    let resp = gh
-        .client
-        .get(&artifact.archive_download_url)
-        .header("Authorization", format!("Bearer {}", gh.app.token().await.unwrap()))
-        .header("Accept", "application/octet-stream")
-        .send()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("download: {e}")))?
-        .error_for_status()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("download non-2xx: {e}")))?;
-    let pkg_bytes = resp.bytes().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("download bytes: {e}")))?;
-    let pkg_size = pkg_bytes.len();
-
-    // 2. Decide channel release tag
-    let tag = match form.channel.as_str() {
-        "stable" => "stable".to_string(),
-        "beta" => "channel-beta".to_string(),
-        "alpha" => "channel-alpha".to_string(),
-        other => return (
-            StatusCode::BAD_REQUEST,
-            format!("unknown channel '{other}'"),
-        )
-            .into_response(),
-    };
-
-    // 3. Find or create the channel release
-    let release = get_or_create_release(gh, pkg_repo, &tag, &form.channel).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("release: {e}")))?;
-
-    // 4. Download the current zohara.db from the release (if any)
-    let db_asset = release.assets.iter().find(|a| a.name == "zohara.db").cloned();
-    if let Some(db) = &db_asset {
-        let _ = gh
-            .download_to_file(
-                &db.browser_download_url,
-                std::path::Path::new("/tmp/zohara.db"),
-            )
-            .await;
+fn err_page(msg: &str) -> Response {
+    let html = ErrorTpl {
+        title: "zohara-updates-system",
+        err: msg,
     }
-    if !std::path::Path::new("/tmp/zohara.db").exists() {
-        std::fs::write("/tmp/zohara.db", b"")?;
-    }
-
-    // 5. Save the .pkg.tar.zst to disk
-    std::fs::write(&pkg_file, &pkg_bytes)?;
-
-    // 6. Run repo-add (we expect the runtime image to have pacman + repo-add)
-    let add_status = std::process::Command::new("repo-add")
-        .args(["--new", "--remove", "zohara.db.tar.gz", &pkg_file])
-        .status();
-    let add_ok = add_status.map(|s| s.success()).unwrap_or(false);
-    if !add_ok {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("repo-add failed; status: {:?}", add_status),
-        )
-            .into_response();
-    }
-    // Some repo-add versions need a manual copy
-    if !std::path::Path::new("zohara.db").exists() {
-        std::fs::copy("zohara.db.tar.gz", "zohara.db")?;
-    }
-
-    // 7. Re-upload package + db to the release
-    let upload_url = format!(
-        "https://uploads.github.com/repos/{pkg_repo}/releases/{}/assets",
-        release.id
-    );
-    let token = gh.app.token().await.unwrap();
-
-    async fn upload_one(
-        client: &reqwest::Client,
-        upload_url: &str,
-        token: &str,
-        name: &str,
-        path: &std::path::Path,
-    ) -> Result<()> {
-        let bytes = std::fs::read(path)?;
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(name.to_string());
-        let form = reqwest::multipart::Form::new().part(name, part);
-        let resp = client
-            .post(upload_url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Accept", "application/vnd.github+json")
-            .multipart(form)
-            .send()
-            .await?
-            .error_for_status()?;
-        let _ = resp.text().await?;
-        Ok(())
-    }
-    let _ = upload_one(&gh.client, &upload_url, &token, &pkg_file, std::path::Path::new(&pkg_file)).await;
-    let _ = upload_one(&gh.client, &upload_url, &token, "zohara.db", std::path::Path::new("zohara.db")).await;
-    let _ = upload_one(&gh.client, &upload_url, &token, "zohara.db.tar.gz", std::path::Path::new("zohara.db.tar.gz")).await;
-
-    // 8. Update apps.json in the repo
-    let _ = update_apps_json(gh, pkg_repo, pkg_name, &pkg_ver, &tag).await;
-
-    let msg = format!(
-        "ok: published {} v{} ({} bytes) to {} -> {}",
-        pkg_name,
-        pkg_ver,
-        pkg_size,
-        form.repo,
-        tag
-    );
-    (StatusCode::OK, msg).into_response()
+    .render()
+    .unwrap_or_else(|e| format!("template err: {e}\norig: {msg}"));
+    (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response()
 }
 
-async fn read_version_from_run(gh: &Gh, repo: &str, run_id: u64) -> Result<String> {
-    // Best-effort: read the version from the workflow run's `version` step
-    // output. Falls back to a default if not parseable.
-    let jobs_url = format!(
-        "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
-    );
-    #[derive(Deserialize)]
-    struct JobsResp {
-        jobs: Vec<Job>,
-    }
-    #[derive(Deserialize)]
-    struct Job {
-        steps: Vec<Step>,
-    }
-    #[derive(Deserialize)]
-    struct Step {
-        name: String,
-        conclusion: Option<String>,
-    }
-    let resp: JobsResp = gh.get_json(&jobs_url).await?;
-    for job in &resp.jobs {
-        for step in &job.steps {
-            if step.name.contains("Compute version") && step.conclusion.as_deref() == Some("success") {
-                // We don't have access to step output via the API without
-                // an extra call. Default to 0.1.0 for now and let the user
-                // override if needed.
-                return Ok("0.1.0".to_string());
+fn render_html<T: Template>(t: T) -> Response {
+    t.render()
+        .map(|b| Html(b).into_response())
+        .unwrap_or_else(|e| err_page(&format!("template error: {e}")))
+}
+
+async fn index(State(s): State<AppState>) -> Response {
+    let mut summaries = Vec::new();
+    for (owner, name) in &s.cfg.watched_repos {
+        let url = format!("https://api.github.com/repos/{owner}/{name}");
+        match s.gh.get_json::<RepoInfo>(&url).await {
+            Ok(r) => summaries.push(RepoSummary {
+                owner: owner.clone(),
+                name: name.clone(),
+                full: r.full_name,
+                description: r.description.unwrap_or_default(),
+                stars: r.stargazers_count,
+                issues: r.open_issues_count,
+                html_url: format!("https://github.com/{owner}/{name}"),
+            }),
+            Err(e) => {
+                return render_html(IndexTpl {
+                    title: "zohara-updates-system",
+                    repos: &[],
+                    err: Some(&format!("failed to list {owner}/{name}: {e}")),
+                });
             }
         }
     }
-    Ok("0.1.0".to_string())
+    render_html(IndexTpl {
+        title: "zohara-updates-system",
+        repos: &summaries,
+        err: None,
+    })
 }
 
-async fn get_or_create_release(
+async fn repo_view(
+    State(s): State<AppState>,
+    Path((owner, name)): Path<(String, String)>,
+) -> Response {
+    let full = format!("{owner}/{name}");
+    let repo_url = format!("https://api.github.com/repos/{full}");
+    let runs_url = format!(
+        "https://api.github.com/repos/{full}/actions/runs?per_page=15&status=success"
+    );
+
+    let repo: RepoInfo = match s.gh.get_json(&repo_url).await {
+        Ok(r) => r,
+        Err(e) => return err_page(&format!("failed to load {full}: {e}")),
+    };
+    let runs: WorkflowRuns = match s.gh.get_json(&runs_url).await {
+        Ok(r) => r,
+        Err(e) => return err_page(&format!("failed to list runs for {full}: {e}")),
+    };
+
+    let summary = RepoSummary {
+        owner: owner.clone(),
+        name: name.clone(),
+        full: repo.full_name,
+        description: repo.description.unwrap_or_default(),
+        stars: repo.stargazers_count,
+        issues: repo.open_issues_count,
+        html_url: format!("https://github.com/{full}"),
+    };
+    render_html(RepoTpl {
+        title: "zohara-updates-system",
+        repo: &summary,
+        runs: &runs.workflow_runs,
+    })
+}
+
+async fn publish(
+    State(s): State<AppState>,
+    Form(f): Form<PublishForm>,
+) -> Response {
+    do_publish(s, f).await.unwrap_or_else(|e| err_page(&e))
+}
+
+async fn do_publish(s: AppState, f: PublishForm) -> std::result::Result<Redirect, String> {
+    let (owner, name) = f
+        .repo
+        .split_once('/')
+        .ok_or_else(|| "repo must be owner/name".to_string())?
+        .to_owned();
+    let channel = f.channel.to_lowercase();
+    if !["stable", "beta", "alpha"].contains(&channel.as_str()) {
+        return Err(format!("invalid channel: {channel}"));
+    }
+    let pkg_repo = (s.cfg.pkg_repo.0.clone(), s.cfg.pkg_repo.1.clone());
+
+    // 1. List the run's artifacts
+    let arts_url = format!(
+        "https://api.github.com/repos/{owner}/{name}/actions/runs/{}/artifacts",
+        f.run_id
+    );
+    let arts: Artifacts = s
+        .gh
+        .get_json(&arts_url)
+        .await
+        .map_err(|e| format!("list artifacts: {e:#}"))?;
+    let art = arts
+        .artifacts
+        .into_iter()
+        .find(|a| a.name.ends_with(".pkg.tar.zst"))
+        .ok_or_else(|| "no .pkg.tar.zst artifact on this run".to_string())?;
+
+    // 2. Download
+    let pkg_bytes = s
+        .gh
+        .get_bytes(&art.archive_download_url)
+        .await
+        .map_err(|e| format!("download artifact: {e:#}"))?;
+    let work = env::temp_dir().join(format!("zohara-pub-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| format!("mkdir work: {e}"))?;
+    let pkg_path = work.join(&art.name);
+    std::fs::write(&pkg_path, &pkg_bytes).map_err(|e| format!("write pkg: {e}"))?;
+
+    // 3. Get/create the channel release
+    let tag = if channel == "stable" {
+        "stable".to_string()
+    } else {
+        format!("channel-{channel}")
+    };
+    let release = ensure_release(&s.gh, &pkg_repo.0, &pkg_repo.1, &tag, &channel)
+        .await
+        .map_err(|e| format!("ensure release: {e:#}"))?;
+
+    // 4. Find existing zohara.db asset (if any) and replace it
+    let assets: Vec<ReleaseAsset> = s
+        .gh
+        .get_json(&format!(
+            "https://api.github.com/repos/{}/{}/releases/{}/assets",
+            pkg_repo.0, pkg_repo.1, release.id
+        ))
+        .await
+        .map_err(|e| format!("list release assets: {e:#}"))?;
+    let db_asset = assets.iter().find(|a| a.name == "zohara.db").cloned();
+    let pkg_asset = assets.iter().find(|a| a.name == art.name).cloned();
+
+    // 5. Run repo-add to add the package to the local db
+    let out = std::process::Command::new("repo-add")
+        .current_dir(&work)
+        .arg("zohara.db")
+        .arg(&pkg_path)
+        .output()
+        .map_err(|e| format!("repo-add: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "repo-add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let new_db = std::fs::read(work.join("zohara.db"))
+        .map_err(|e| format!("read new zohara.db: {e}"))?;
+
+    // 6. Delete old assets (so we can re-upload with same name)
+    if let Some(a) = &db_asset {
+        s.gh
+            .delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id)
+            .await
+            .map_err(|e| format!("delete old zohara.db: {e:#}"))?;
+    }
+    if let Some(a) = &pkg_asset {
+        if pkg_asset.as_ref().map(|x| x.id) != db_asset.as_ref().map(|x| x.id) {
+            s.gh
+                .delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id)
+                .await
+                .map_err(|e| format!("delete old pkg: {e:#}"))?;
+        }
+    }
+
+    // 7. Upload the new db and the new package
+    s.gh
+        .upload_asset(&release.upload_url, "zohara.db", &new_db)
+        .await
+        .map_err(|e| format!("upload zohara.db: {e:#}"))?;
+    s.gh
+        .upload_asset(&release.upload_url, &art.name, &pkg_bytes)
+        .await
+        .map_err(|e| format!("upload pkg: {e:#}"))?;
+
+    // 8. Update apps.json in the package repo
+    if let Err(e) = update_apps_json(&s.gh, &pkg_repo.0, &pkg_repo.1, &art.name).await {
+        log::warn!("apps.json update skipped: {e:#}");
+    }
+
+    Ok(Redirect::to(&format!("/repo/{owner}/{name}")))
+}
+
+async fn ensure_release(
     gh: &Gh,
-    repo: &str,
+    owner: &str,
+    name: &str,
     tag: &str,
     channel: &str,
 ) -> Result<Release> {
-    // Try to fetch existing
-    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    if let Ok(r) = gh.get_json::<Release>(&url).await {
+    let by_tag = format!("https://api.github.com/repos/{owner}/{name}/releases/tags/{tag}");
+    if let Ok(r) = gh.get_json::<Release>(&by_tag).await {
         return Ok(r);
     }
-    // Create
-    let title = format!("Zohara Packages — {channel}");
-    let body = format!(
-        "Auto-managed Arch package repository for the **{channel}** channel.\n\n\
-         Updated by [zohara-hub](https://github.com/Zohaib8090/zohara-hub).\n\n\
-         `pacman -Syu` on a Zohara OS system configured for this channel \
-         will pick up packages from here."
-    );
-    let prerelease = channel != "stable";
-    let payload = serde_json::json!({
-        "tag_name": tag,
-        "target_commitish": "main",
-        "name": title,
-        "body": body,
-        "prerelease": prerelease,
-        "draft": false,
-    });
-    let url = format!("https://api.github.com/repos/{repo}/releases");
-    let r: Release = gh.post_json(&url, &payload).await?;
+    #[derive(Serialize)]
+    struct NewRelease<'a> {
+        tag_name: &'a str,
+        name: &'a str,
+        body: &'a str,
+        draft: bool,
+        prerelease: bool,
+    }
+    let new = NewRelease {
+        tag_name: tag,
+        name: &format!("Zohara {channel} channel"),
+        body: &format!("Auto-managed by zohara-updates-system. OTA channel: {channel}."),
+        draft: false,
+        prerelease: channel != "stable",
+    };
+    let url = format!("https://api.github.com/repos/{owner}/{name}/releases");
+    let r: Release = gh
+        .put_json(&url, &new)
+        .await
+        .context("create release")?;
     Ok(r)
 }
 
-async fn update_apps_json(gh: &Gh, repo: &str, pkg_name: &str, ver: &str, tag: &str) -> Result<()> {
-    let url = format!("https://api.github.com/repos/{repo}/contents/apps.json");
-    let file: serde_json::Value = gh.get_json(&url).await?;
-    let content_b64 = file
-        .get("content")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("apps.json content not found"))?
-        .replace('\n', "");
-    let bytes = base64_decode(&content_b64)?;
-    let mut data: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let arr = data
-        .as_object_mut()
-        .and_then(|o| o.get_mut("apps"))
-        .and_then(|a| a.as_array_mut())
-        .ok_or_else(|| anyhow::anyhow!("apps.json: missing 'apps' array"))?;
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let new_entry = serde_json::json!({
-        "id": pkg_name,
-        "name": pkg_name.replace('-', " ").to_string(),
-        "publisher": "Zohara OS Team",
-        "description": format!("{} — published via zohara-hub.", pkg_name),
-        "category": "System",
-        "icon_url": format!("https://raw.githubusercontent.com/Zohaib8090/{}/main/data/icons/scalable/apps/{}.svg", pkg_name, pkg_name),
-        "type": "pacman",
-        "package": pkg_name,
-        "current_version": ver,
-        "versions": [{
-            "version": ver,
-            "release_date": today,
-            "download_url": format!("https://github.com/{}/releases/download/{}/{}-{}-1-x86_64.pkg.tar.zst", repo, tag, pkg_name, ver),
-            "changelog": format!("Auto-published from {} v{}", pkg_name, ver),
-        }]
-    });
-    if let Some(idx) = arr.iter().position(|a| a.get("id").and_then(|i| i.as_str()) == Some(pkg_name)) {
-        arr[idx] = new_entry;
-    } else {
-        arr.push(new_entry);
+async fn update_apps_json(
+    gh: &Gh,
+    owner: &str,
+    name: &str,
+    pkg_filename: &str,
+) -> Result<()> {
+    let pkg = pkg_filename.trim_end_matches(".pkg.tar.zst");
+    let url = format!("https://api.github.com/repos/{owner}/{name}/contents/apps.json");
+    let existing: Option<ContentEntry> = gh.get_json(&url).await.ok();
+    let mut apps: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    if let Some(e) = &existing {
+        if let Some(dl) = &e.download_url {
+            if let Ok(bytes) = gh.get_bytes(dl).await {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(obj) = v.as_object() {
+                        for (k, v) in obj {
+                            apps.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
-    let new_bytes = serde_json::to_vec_pretty(&data)?;
-    let new_b64 = base64_encode(&new_bytes);
-    let sha = file.get("sha").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("no sha on file"))?;
-    let commit_msg = format!("apps: bump {pkg_name} to {ver}");
-    let payload = serde_json::json!({
-        "message": commit_msg,
-        "content": new_b64,
-        "sha": sha,
-        "branch": "main",
-    });
-    let _url = format!("https://api.github.com/repos/{repo}/contents/apps.json");
-    let _: serde_json::Value = gh.put_json(&_url, &payload).await?;
+    apps.insert(
+        pkg.to_string(),
+        serde_json::json!({
+            "last_published": chrono::Utc::now().to_rfc3339(),
+            "source": "zohara-updates-system",
+            "filename": pkg_filename,
+        }),
+    );
+    let body = serde_json::to_string_pretty(&apps)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
+
+    #[derive(Serialize)]
+    struct PutFile<'a> {
+        message: &'a str,
+        content: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha: Option<&'a str>,
+    }
+    let put = PutFile {
+        message: &format!("chore(publish): record {pkg} via zohara-updates-system"),
+        content: &b64,
+        sha: existing.as_ref().map(|e| e.sha.as_str()),
+    };
+    let _: serde_json::Value = gh.put_json(&url, &put).await?;
     Ok(())
 }
 
-// ── AppState ─────────────────────────────────────────────────────────────
+// ── Health / fallback ───────────────────────────────────────────────────
 
-#[derive(Clone)]
-struct AppState {
-    gh: Gh,
-    config: Arc<AppConfig>,
-    hbs: Arc<Handlebars<'static>>,
+async fn health() -> &'static str {
+    "ok\n"
 }
 
-// ── main ────────────────────────────────────────────────────────────────
+async fn root_fallback() -> Redirect {
+    Redirect::to("/")
+}
+
+// ── Main ────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .init();
-
-    // Read GitHub App credentials from env.
-    let app_id = std::env::var("ZOHARA_HUB_APP_ID").context("ZOHARA_HUB_APP_ID")?;
-    let private_key_pem = std::env::var("ZOHARA_HUB_APP_PRIVATE_KEY")
-        .context("ZOHARA_HUB_APP_PRIVATE_KEY")?;
-    let installation_id = std::env::var("ZOHARA_HUB_INSTALLATION_ID")
-        .context("ZOHARA_HUB_INSTALLATION_ID")?;
-
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".into())
-        .parse()
-        .context("PORT must be u16")?;
-
-    // Watched source repos.
-    let config = AppConfig {
-        sources: vec![
-            WatchedSource {
-                repo: "Zohaib8090/zohara-settings".into(),
-                package: "zohara-settings".into(),
-                arch: "x86_64",
-            },
-            WatchedSource {
-                repo: "Zohaib8090/zohara-store".into(),
-                package: "zohara-store".into(),
-                arch: "x86_64",
-            },
-            WatchedSource {
-                repo: "Zohaib8090/zohara-apps".into(),
-                package: "zohara-welcome".into(),
-                arch: "x86_64",
-            },
-        ],
-    };
-
-    let gh_app = GhApp {
-        app_id,
-        private_key_pem,
-        installation_id,
-        cached_token: Arc::new(tokio::sync::RwLock::new(None)),
-    };
-    let gh = Gh::new(gh_app);
-
-    // Handlebars templates (inline so we don't need a templates dir at
-    // runtime; Render's ephemeral disk would wipe it on each deploy).
-    let mut hbs = Handlebars::new();
-    hbs.register_template_string(
-        "index",
-        include_str!("../templates/index.hbs"),
-    )?;
-    hbs.register_template_string(
-        "repo",
-        include_str!("../templates/repo.hbs"),
-    )?;
-
+    let cfg = AppConfig::from_env()?;
+    let auth = AppAuth::new(
+        cfg.app_id,
+        cfg.installation_id,
+        cfg.private_key_pem.clone(),
+    );
+    let gh = Gh::new(auth);
     let state = AppState {
+        cfg: Arc::new(cfg),
         gh,
-        config: Arc::new(config),
-        hbs: Arc::new(hbs),
     };
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/repo/:owner/:name", get(repo))
+        .route("/health", get(health))
+        .route("/repo/:owner/:name", get(repo_view))
         .route("/publish", post(publish))
         .with_state(state);
 
-    log::info!("zohara-hub listening on 0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    Server::serve(listener, app).await?;
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .with_context(|| format!("bind 0.0.0.0:{port}"))?;
+    log::info!("zohara-updates-system listening on 0.0.0.0:{port}");
+    axum::serve(listener, app).await?;
     Ok(())
 }
-
-// Tiny base64 helpers (the standard `base64` crate would be cleaner but
-// we already pulled in `hex`; keep deps minimal).
-fn base64_encode(data: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(data)
-}
-
-fn base64_decode(input: &str) -> Result<Vec<u8>> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(input)
-        .context("base64 decode")
-}
-

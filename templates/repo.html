@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ title }}</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+           background:#0d1117; color:#c9d1d9; margin:0; padding:2rem; }
+    a { color:#58a6ff; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    h1, h2 { font-weight:500; }
+    .header { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1rem 1.5rem; }
+    .meta { color:#8b949e; font-size:0.9rem; }
+    .run { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1rem 1.5rem; margin:1rem 0; }
+    .run-title { font-weight:600; }
+    .run-meta { color:#8b949e; font-size:0.85rem; margin:0.4rem 0; }
+    form { display:inline-block; margin-right:0.5rem; }
+    button { background:#238636; color:#fff; border:0; border-radius:6px; padding:0.4rem 0.8rem; cursor:pointer; font-size:0.9rem; }
+    button.beta { background:#1f6feb; }
+    button.alpha { background:#d29922; }
+    .err { background:#3d1d1d; border:1px solid #f85149; padding:1rem; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <p><a href="/">← all repos</a></p>
+  <div class="header">
+    <h1>{{ repo.full }}</h1>
+    <div class="meta">{{ repo.description }}</div>
+    <div class="meta">★ {{ repo.stars }} · issues {{ repo.issues }} ·
+      <a href="{{ repo.html_url }}">github</a></div>
+  </div>
+
+  {% if let Some(e) = err %}
+  <div class="err">{{ e }}</div>
+  {% endif %}
+
+  <h2>Recent successful runs</h2>
+  {% if runs.is_empty() %}
+  <p class="meta">No successful runs yet.</p>
+  {% endif %}
+  {% for r in runs %}
+  <div class="run">
+    <div class="run-title">
+      <a href="{{ r.html_url }}">{{ r.display_title }}</a>
+    </div>
+    <div class="run-meta">
+      #{{ r.id }} · {{ r.head_branch }}@{{ r.head_sha | truncate(length=7, end="") }}
+      · {{ r.created_at }} · {{ r.name }}
+    </div>
+    <form method="post" action="/publish">
+      <input type="hidden" name="repo" value="{{ repo.full }}">
+      <input type="hidden" name="run_id" value="{{ r.id }}">
+      <button type="submit" name="channel" value="stable">Publish to stable</button>
+    </form>
+    <form method="post" action="/publish">
+      <input type="hidden" name="repo" value="{{ repo.full }}">
+      <input type="hidden" name="run_id" value="{{ r.id }}">
+      <button class="beta" type="submit" name="channel" value="beta">Publish to beta</button>
+    </form>
+    <form method="post" action="/publish">
+      <input type="hidden" name="repo" value="{{ repo.full }}">
+      <input type="hidden" name="run_id" value="{{ r.id }}">
+      <button class="alpha" type="submit" name="channel" value="alpha">Publish to alpha</button>
+    </form>
+  </div>
+  {% endfor %}
+</body>
+</html>
