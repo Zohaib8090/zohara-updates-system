@@ -635,7 +635,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     // 5. Run repo-add to add the package to the local db
     let out = match std::process::Command::new("repo-add")
         .current_dir(&work)
-        .arg("zohara")
+        .arg("zohara.db.tar.zst")
         .arg(&pkg_path)
         .output() {
         Ok(o) => o,
@@ -647,7 +647,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let new_db = match std::fs::read(work.join("zohara.db")) {
+    let new_db = match std::fs::read(work.join("zohara.db.tar.zst")) {
         Ok(b) => b,
         Err(e) => return err_page(&format!("read new zohara.db: {e}")),
     };
