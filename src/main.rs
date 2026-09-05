@@ -278,6 +278,7 @@ impl Gh {
     ) -> Result<()> {
         let base = release_upload_url.split('?').next().unwrap_or(release_upload_url);
         let url = format!("{base}?name={}", urlencode(name));
+        log::info!("upload_asset: url={} name={} bytes={}", url, name, bytes.len());
         let auth = self.auth_header().await?;
         // GitHub release upload endpoint:
         //   POST {upload_url}?name={filename}
