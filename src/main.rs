@@ -279,14 +279,19 @@ impl Gh {
         let base = release_upload_url.split('?').next().unwrap_or(release_upload_url);
         let url = format!("{base}?name={}", urlencode(name));
         let auth = self.auth_header().await?;
+        // GitHub release upload endpoint requires multipart/form-data.
+        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+            .file_name(name.to_string())
+            .mime_str("application/octet-stream")
+            .context("build multipart part")?;
+        let form = reqwest::multipart::Form::new().part("file", part);
         let resp = self
             .client
             .post(&url)
             .header("Authorization", auth)
             .header("Accept", "application/vnd.github+json")
-            .header("Content-Type", "application/octet-stream")
             .header("User-Agent", "zohara-updates-system")
-            .body(bytes.to_vec())
+            .multipart(form)
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
