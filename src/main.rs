@@ -662,9 +662,14 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         ));
     }
     let new_db = match std::fs::read(work.join("zohara.db.tar.zst")) {
-        Ok(b) => b,
+        Ok(b) => {
+            log::info!("new_db size: {} bytes", b.len());
+            b
+        }
         Err(e) => return err_page(&format!("read new zohara.db: {e}")),
     };
+    // also check the .files
+    let _ = std::fs::read(work.join("zohara.files.tar.zst"));
 
     // 6. Delete old assets (so we can re-upload with same name)
     if let Some(a) = &db_asset {
