@@ -279,30 +279,28 @@ impl Gh {
         let base = release_upload_url.split('?').next().unwrap_or(release_upload_url);
         let url = format!("{base}?name={}", urlencode(name));
         let auth = self.auth_header().await?;
-        // GitHub release upload endpoint requires multipart/form-data.
-        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-            .file_name(name.to_string())
-            .mime_str("application/octet-stream")
-            .context("build multipart part")?;
-        let form = reqwest::multipart::Form::new().part("file", part);
+        // GitHub release upload endpoint:
+        //   POST {upload_url}?name={filename}
+        //   Content-Type: application/octet-stream
+        //   Body: raw file bytes
+        // No Accept: application/vnd.github+json — that header tells
+        // the server to parse it as an API call and the response will
+        // be a 415 "Unsupported Media Type". Use Accept: */* instead.
         let resp = self
             .client
             .post(&url)
             .header("Authorization", auth)
-            .header("Accept", "application/vnd.github+json")
+            .header("Accept", "*/*")
             .header("User-Agent", "zohara-updates-system")
-            .multipart(form)
+            .header("Content-Type", "application/octet-stream")
+            .body(bytes.to_vec())
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
         let s = resp.status();
-        if s.as_u16() == 422 {
-            let t = resp.text().await.unwrap_or_default();
-            bail!("upload asset `{name}` returned 422: {t}");
-        }
         if !s.is_success() {
             let t = resp.text().await.unwrap_or_default();
-            bail!("upload asset `{name}`: HTTP {s} {t}");
+            bail!("upload asset `{name}`: HTTP {s} body={t}");
         }
         Ok(())
     }
