@@ -634,8 +634,16 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         Ok(x) => x,
         Err(e) => return err_page(&format!("list release assets: {e:#}")),
     };
-    let db_asset = assets.iter().find(|a| a.name == "zohara.db").cloned();
+    // Match the db by its base name, regardless of compression
+    // extension (zohara.db, zohara.db.tar.gz, zohara.db.tar.zst, ...).
+    let db_asset = assets
+        .iter()
+        .find(|a| a.name == "zohara.db" || a.name.starts_with("zohara.db."))
+        .cloned();
     let pkg_asset = assets.iter().find(|a| a.name == pkg_name).cloned();
+    // 4b. Also delete any leftover .pkg.tar.zst files for the same package
+    // version (rare, but happens if the same version was previously published
+    // under a slightly different name).
 
     // 5. Run repo-add to add the package to the local db
     let out = match std::process::Command::new("repo-add")
@@ -660,7 +668,7 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
     // 6. Delete old assets (so we can re-upload with same name)
     if let Some(a) = &db_asset {
         if let Err(e) = s.gh.delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id).await {
-            return err_page(&format!("delete old zohara.db: {e:#}"));
+            return err_page(&format!("delete old db asset: {e:#}"));
         }
     }
     if let Some(a) = &pkg_asset {
@@ -676,8 +684,8 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         Ok(b) => b,
         Err(e) => return err_page(&format!("read pkg for upload: {e}")),
     };
-    if let Err(e) = s.gh.upload_asset(&release.upload_url, "zohara.db", &new_db).await {
-        return err_page(&format!("upload zohara.db: {e:#}"));
+    if let Err(e) = s.gh.upload_asset(&release.upload_url, "zohara.db.tar.zst", &new_db).await {
+        return err_page(&format!("upload zohara.db.tar.zst: {e:#}"));
     }
     if let Err(e) = s.gh.upload_asset(&release.upload_url, &pkg_name, &pkg_upload_bytes).await {
         return err_page(&format!("upload pkg: {e:#}"));
