@@ -297,7 +297,8 @@ impl Gh {
             .with_context(|| format!("POST {url}"))?;
         let s = resp.status();
         if s.as_u16() == 422 {
-            bail!("asset `{name}` already exists on this release (HTTP 422)");
+            let t = resp.text().await.unwrap_or_default();
+            bail!("upload asset `{name}` returned 422: {t}");
         }
         if !s.is_success() {
             let t = resp.text().await.unwrap_or_default();
