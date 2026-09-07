@@ -301,7 +301,7 @@ impl Gh {
                     let mut req = attempt.previous().clone();
                     *req.body_mut() = attempt.body().cloned();
                     let url = attempt.url().clone();
-                    attempt.follow(req, url)
+                    attempt.follow(req)
                 }
             }))
             .build()
