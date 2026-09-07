@@ -278,36 +278,26 @@ impl Gh {
     ) -> Result<()> {
         // The upload URL from GitHub looks like:
         //   https://uploads.github.com/.../releases/.../assets{?name,label}
-        // Strip the {?name,label} suffix and append our own ?name=... .
+        // It's a URI template -- strip the {?name,label} suffix and
+        // append our own ?name=... .
         let base = release_upload_url
             .split('{')
             .next()
             .unwrap_or(release_upload_url);
         let url = format!("{base}?name={}", urlencode(name));
-        log::info!("upload_asset: url={} name={} bytes={}", url, name, bytes.len());
+        log::info!("upload_asset: step 1 url={} name={} bytes={}", url, name, bytes.len());
         let auth = self.auth_header().await?;
-        // GitHub returns 302 redirecting to S3 with the body. reqwest's
-        // default redirect policy strips the body on 302 (per HTTP spec),
-        // so the S3 upload arrives empty. Use a custom policy that keeps
-        // the body for any redirect, and follows at most 5 hops.
-        let upload_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 4 {
-                    attempt.stop()
-                } else {
-                    // 307/308 keep body by default. 301/302 normally
-                    // strip it; force the request to follow with body.
-                    let mut req = attempt.previous().clone();
-                    *req.body_mut() = attempt.body().cloned();
-                    let url = attempt.url().clone();
-                    attempt.follow(req)
-                }
-            }))
-            .build()
-            .context("build upload client")?;
 
-        let resp = upload_client
+        // Step 1: POST to api.github.com / uploads.github.com with the
+        // raw file body. GitHub returns 302 with a Location header
+        // pointing to S3 (pre-signed). We do NOT follow the redirect;
+        // reqwest strips the body on 302 and that breaks S3.
+        let no_redirect = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("build no-redirect client")?;
+        let resp = no_redirect
             .post(&url)
             .header("Authorization", auth)
             .header("Accept", "*/*")
@@ -317,10 +307,39 @@ impl Gh {
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
-        let s = resp.status();
-        if !s.is_success() {
+        let status = resp.status();
+        // 200/201 = direct success (some old releases don't redirect)
+        if status.is_success() {
+            log::info!("upload_asset: step 1 returned {}", status);
+            return Ok(());
+        }
+        // 302 = GitHub returned the S3 URL
+        if status != reqwest::StatusCode::FOUND && status != reqwest::StatusCode::TEMPORARY_REDIRECT {
             let t = resp.text().await.unwrap_or_default();
-            bail!("upload asset `{name}`: HTTP {s} body={t}");
+            bail!("upload asset `{name}` step 1: HTTP {status} body={t}");
+        }
+        let s3_url = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| anyhow!("no Location header on 302"))?
+            .to_string();
+        log::info!("upload_asset: step 2 url={}", &s3_url[..80.min(s3_url.len())]);
+
+        // Step 2: PUT the body to S3. No auth needed (URL is pre-signed).
+        // No Accept: application/vnd.github+json header either, just like
+        // GitHub's docs say for S3 upload.
+        let s3_resp = no_redirect
+            .put(&s3_url)
+            .header("Content-Type", "application/octet-stream")
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .with_context(|| format!("PUT {s3_url}"))?;
+        let s3_status = s3_resp.status();
+        if !s3_status.is_success() {
+            let t = s3_resp.text().await.unwrap_or_default();
+            bail!("upload asset `{name}` step 2: HTTP {s3_status} body={t}");
         }
         Ok(())
     }
