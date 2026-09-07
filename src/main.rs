@@ -280,15 +280,28 @@ impl Gh {
         let url = format!("{base}?name={}", urlencode(name));
         log::info!("upload_asset: url={} name={} bytes={}", url, name, bytes.len());
         let auth = self.auth_header().await?;
-        // GitHub release upload endpoint:
-        //   POST {upload_url}?name={filename}
-        //   Content-Type: application/octet-stream
-        //   Body: raw file bytes
-        // No Accept: application/vnd.github+json — that header tells
-        // the server to parse it as an API call and the response will
-        // be a 415 "Unsupported Media Type". Use Accept: */* instead.
-        let resp = self
-            .client
+        // GitHub returns 302 redirecting to S3 with the body. reqwest's
+        // default redirect policy strips the body on 302 (per HTTP spec),
+        // so the S3 upload arrives empty. Use a custom policy that keeps
+        // the body for any redirect, and follows at most 5 hops.
+        let upload_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 4 {
+                    attempt.stop()
+                } else {
+                    // 307/308 keep body by default. 301/302 normally
+                    // strip it; force the request to follow with body.
+                    let mut req = attempt.previous().clone();
+                    *req.body_mut() = attempt.body().cloned();
+                    let url = attempt.url().clone();
+                    attempt.follow(req, url)
+                }
+            }))
+            .build()
+            .context("build upload client")?;
+
+        let resp = upload_client
             .post(&url)
             .header("Authorization", auth)
             .header("Accept", "*/*")
