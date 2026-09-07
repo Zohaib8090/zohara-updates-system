@@ -285,7 +285,6 @@ impl Gh {
             .next()
             .unwrap_or(release_upload_url);
         let url = format!("{base}?name={}", urlencode(name));
-        log::info!("upload_asset: step 1 url={} name={} bytes={}", url, name, bytes.len());
         let auth = self.auth_header().await?;
 
         // Step 1: POST to api.github.com / uploads.github.com with the
@@ -310,7 +309,6 @@ impl Gh {
         let status = resp.status();
         // 200/201 = direct success (some old releases don't redirect)
         if status.is_success() {
-            log::info!("upload_asset: step 1 returned {}", status);
             return Ok(());
         }
         // 302 = GitHub returned the S3 URL
@@ -324,7 +322,6 @@ impl Gh {
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| anyhow!("no Location header on 302"))?
             .to_string();
-        log::info!("upload_asset: step 2 url={}", &s3_url[..80.min(s3_url.len())]);
 
         // Step 2: PUT the body to S3. No auth needed (URL is pre-signed).
         // No Accept: application/vnd.github+json header either, just like
@@ -699,14 +696,9 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         ));
     }
     let new_db = match std::fs::read(work.join("zohara.db.tar.zst")) {
-        Ok(b) => {
-            log::info!("new_db size: {} bytes", b.len());
-            b
-        }
+        Ok(b) => b,
         Err(e) => return err_page(&format!("read new zohara.db: {e}")),
     };
-    // also check the .files
-    let _ = std::fs::read(work.join("zohara.files.tar.zst"));
 
     // 6. Delete old assets (so we can re-upload with same name)
     if let Some(a) = &db_asset {
