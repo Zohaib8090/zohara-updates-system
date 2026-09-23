@@ -21,8 +21,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use askama::Template;
 use axum::{
-    extract::{Form, Path, State},
-    http::StatusCode,
+    extract::{Form, Path, Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
@@ -30,7 +31,7 @@ use axum::{
 use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 // ── App config from env vars ────────────────────────────────────────────
@@ -76,6 +77,48 @@ impl AppConfig {
 
 fn require_env(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("{name} not set"))
+}
+
+// ── Auth ─────────────────────────────────────────────────────────────────
+//
+// There was no auth at all before this: POST /publish downloads a build
+// artifact and pushes it straight into the OTA release + apps.json with
+// no check on who called it, only what a link to this service's port is.
+// HTTP Basic protects every route (the dashboard has nothing that needs to
+// stay public) -- it needs no new dependency (base64 is already pulled in
+// for the GitHub asset-upload path) and every browser handles the login
+// prompt itself, so the templates don't need a login page.
+fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> bool {
+    let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(b64) = value.strip_prefix("Basic ") else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return false;
+    };
+    let Ok(text) = String::from_utf8(decoded) else {
+        return false;
+    };
+    text == format!("{user}:{pass}")
+}
+
+async fn require_auth(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    if check_basic_auth(&headers, &s.auth_user, &s.auth_pass) {
+        return next.run(request).await;
+    }
+    let mut resp = (StatusCode::UNAUTHORIZED, "authentication required\n").into_response();
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        "Basic realm=\"zohara-updates-system\"".parse().unwrap(),
+    );
+    resp
 }
 
 // ── GitHub App auth ─────────────────────────────────────────────────────
@@ -252,6 +295,34 @@ impl Gh {
             .with_context(|| format!("PUT {url}"))?
             .error_for_status()
             .with_context(|| format!("PUT {url} non-2xx"))?;
+        Ok(resp.json().await?)
+    }
+
+    // Distinct from put_json: GitHub's "create a release" is POST
+    // /repos/{owner}/{repo}/releases, not PUT. put_json is kept for the
+    // one call that genuinely is a PUT (Contents API create-or-update, used
+    // by update_apps_json) -- using it for release creation too was silently
+    // wrong: a PUT to the releases *collection* URL 404s/405s rather than
+    // creating anything, so ensure_release() could never actually create a
+    // channel's first release.
+    async fn post_json<B: Serialize, T: for<'de> Deserialize<'de>>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T> {
+        let auth = self.auth_header().await?;
+        let resp = self
+            .client
+            .post(url)
+            .header("Authorization", auth)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "zohara-updates-system")
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .with_context(|| format!("POST {url} non-2xx"))?;
         Ok(resp.json().await?)
     }
 
@@ -475,6 +546,8 @@ struct RepoSummary {
 struct AppState {
     cfg: Arc<AppConfig>,
     gh: Gh,
+    auth_user: String,
+    auth_pass: String,
 }
 
 #[derive(Deserialize)]
@@ -661,7 +734,13 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         Err(e) => return err_page(&format!("ensure release: {e:#}")),
     };
 
-    // 4. Find existing zohara.db asset (if any) and replace it
+    // 4. List everything already on the release: every previously
+    // published .pkg.tar.zst AND whatever db asset (under whatever name)
+    // is there. repo-add only knows about the package files sitting next
+    // to the db when it runs -- it does not consult the db's own file
+    // list to go fetch anything -- so an earlier version of this handler,
+    // which downloaded nothing but the db before calling repo-add, wiped
+    // every other package from the channel on every single publish.
     let assets: Vec<ReleaseAsset> = match s.gh.get_json(&format!(
         "https://api.github.com/repos/{}/{}/releases/{}/assets",
         pkg_repo.0, pkg_repo.1, release.id
@@ -669,22 +748,49 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
         Ok(x) => x,
         Err(e) => return err_page(&format!("list release assets: {e:#}")),
     };
-    // Match the db by its base name, regardless of compression
-    // extension (zohara.db, zohara.db.tar.gz, zohara.db.tar.zst, ...).
-    let db_asset = assets
+    let db_assets: Vec<&ReleaseAsset> = assets
         .iter()
-        .find(|a| a.name == "zohara.db" || a.name.starts_with("zohara.db."))
-        .cloned();
-    let pkg_asset = assets.iter().find(|a| a.name == pkg_name).cloned();
-    // 4b. Also delete any leftover .pkg.tar.zst files for the same package
-    // version (rare, but happens if the same version was previously published
-    // under a slightly different name).
+        .filter(|a| a.name == "zohara.db" || a.name.starts_with("zohara.db."))
+        .collect();
+    let other_pkgs: Vec<&ReleaseAsset> = assets
+        .iter()
+        .filter(|a| a.name.ends_with(".pkg.tar.zst") && a.name != pkg_name)
+        .collect();
+    for a in &other_pkgs {
+        // a.url (the assets API endpoint), not browser_download_url: it
+        // needs the same auth header as everything else here, and works
+        // the same whether or not zohara-packages is ever made private.
+        let bytes = match s.gh.get_bytes(&a.url).await {
+            Ok(b) => b,
+            Err(e) => return err_page(&format!("download existing package {}: {e:#}", a.name)),
+        };
+        if let Err(e) = std::fs::write(work.join(&a.name), bytes) {
+            return err_page(&format!("write existing package {}: {e}", a.name));
+        }
+    }
+    // The new package too, alongside the others, so repo-add sees the
+    // whole channel in one directory.
+    if let Err(e) = std::fs::copy(&pkg_path, work.join(&pkg_name)) {
+        return err_page(&format!("stage new package: {e}"));
+    }
 
-    // 5. Run repo-add to add the package to the local db
+    // 5. Rebuild zohara.db.tar.gz from every *.pkg.tar.zst now in work/.
+    // Not zohara.db.tar.zst: pacman.conf's [zohara] section fetches
+    // "<Server>/zohara.db" (no compression suffix, and gzip is what a
+    // bare "zohara.db" copy needs to actually be), and a mismatched name
+    // just means the file sits on the release unused while pacman 404s.
+    let pkg_globs: Vec<_> = match std::fs::read_dir(&work) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".pkg.tar.zst")))
+            .collect(),
+        Err(e) => return err_page(&format!("read work dir: {e}")),
+    };
     let out = match std::process::Command::new("repo-add")
         .current_dir(&work)
-        .arg("zohara.db.tar.zst")
-        .arg(&pkg_path)
+        .arg("zohara.db.tar.gz")
+        .args(&pkg_globs)
         .output() {
         Ok(o) => o,
         Err(e) => return err_page(&format!("repo-add: {e}")),
@@ -695,39 +801,44 @@ async fn do_publish(s: AppState, f: PublishForm) -> Response {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let new_db = match std::fs::read(work.join("zohara.db.tar.zst")) {
+    let new_db = match std::fs::read(work.join("zohara.db.tar.gz")) {
         Ok(b) => b,
         Err(e) => return err_page(&format!("read new zohara.db: {e}")),
     };
 
-    // 6. Delete old assets (so we can re-upload with same name)
-    if let Some(a) = &db_asset {
+    // 6. Delete every old db asset (under any name -- clears out a stale
+    // zohara.db.tar.zst from before this fix too) and the old copy of the
+    // package being replaced, so the re-upload below isn't left sitting
+    // next to a stale duplicate under a slightly different name.
+    for a in &db_assets {
         if let Err(e) = s.gh.delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id).await {
-            return err_page(&format!("delete old db asset: {e:#}"));
+            return err_page(&format!("delete old db asset {}: {e:#}", a.name));
         }
     }
-    if let Some(a) = &pkg_asset {
-        if pkg_asset.as_ref().map(|x| x.id) != db_asset.as_ref().map(|x| x.id) {
-            if let Err(e) = s.gh.delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id).await {
-                return err_page(&format!("delete old pkg: {e:#}"));
-            }
+    if let Some(a) = assets.iter().find(|a| a.name == pkg_name) {
+        if let Err(e) = s.gh.delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id).await {
+            return err_page(&format!("delete old pkg: {e:#}"));
         }
     }
 
-    // 7. Upload the new db and the new package
+    // 7. Upload the rebuilt db (both names pacman might look for) and the
+    // new package.
     let pkg_upload_bytes = match std::fs::read(&pkg_path) {
         Ok(b) => b,
         Err(e) => return err_page(&format!("read pkg for upload: {e}")),
     };
-    if let Err(e) = s.gh.upload_asset(&release.upload_url, "zohara.db.tar.zst", &new_db).await {
-        return err_page(&format!("upload zohara.db.tar.zst: {e:#}"));
+    if let Err(e) = s.gh.upload_asset(&release.upload_url, "zohara.db.tar.gz", &new_db).await {
+        return err_page(&format!("upload zohara.db.tar.gz: {e:#}"));
+    }
+    if let Err(e) = s.gh.upload_asset(&release.upload_url, "zohara.db", &new_db).await {
+        return err_page(&format!("upload zohara.db: {e:#}"));
     }
     if let Err(e) = s.gh.upload_asset(&release.upload_url, &pkg_name, &pkg_upload_bytes).await {
         return err_page(&format!("upload pkg: {e:#}"));
     }
 
     // 8. Update apps.json in the package repo
-    if let Err(e) = update_apps_json(&s.gh, &pkg_repo.0, &pkg_repo.1, &pkg_name).await {
+    if let Err(e) = update_apps_json(&s.gh, &pkg_repo.0, &pkg_repo.1, &pkg_name, &tag).await {
         log::warn!("apps.json update skipped: {e:#}");
     }
 
@@ -762,57 +873,106 @@ async fn ensure_release(
     };
     let url = format!("https://api.github.com/repos/{owner}/{name}/releases");
     let r: Release = gh
-        .put_json(&url, &new)
+        .post_json(&url, &new)
         .await
         .context("create release")?;
     Ok(r)
 }
 
-async fn update_apps_json(
-    gh: &Gh,
-    owner: &str,
-    name: &str,
-    pkg_filename: &str,
-) -> Result<()> {
-    let pkg = pkg_filename.trim_end_matches(".pkg.tar.zst");
+/// "zohara-settings-0.1.0-1-x86_64.pkg.tar.zst" -> ("zohara-settings", "0.1.0").
+/// Arch package names may themselves contain dashes, so this trims known
+/// fixed suffixes from the right instead of splitting on the first dash.
+fn parse_pkg_filename(filename: &str) -> Option<(String, String)> {
+    let stem = filename
+        .strip_suffix(".pkg.tar.zst")
+        .or_else(|| filename.strip_suffix(".pkg.tar.xz"))?;
+    let stem = stem.strip_suffix("-x86_64").or_else(|| stem.strip_suffix("-any"))?;
+    let (rest, _pkgrel) = stem.rsplit_once('-')?;
+    let (pkgname, pkgver) = rest.rsplit_once('-')?;
+    Some((pkgname.to_string(), pkgver.to_string()))
+}
+
+/// Patches the *real* apps.json schema ({"apps": [...], "featured": [...],
+/// ...}), matching what zohara-packages/.github/workflows/publish.yml
+/// writes. The previous version of this function ignored that schema
+/// entirely and treated the whole file as a flat {package: metadata} map,
+/// which meant every publish through this dashboard added a stray
+/// top-level key (e.g. "zohara-settings-0.1.0-1-x86_64") next to the real
+/// "apps" array instead of updating an app's entry in it -- confirmed
+/// still sitting in apps.json from the 2026-09-07 publish through here.
+async fn update_apps_json(gh: &Gh, owner: &str, name: &str, pkg_filename: &str, tag: &str) -> Result<()> {
+    let Some((pkg, ver)) = parse_pkg_filename(pkg_filename) else {
+        bail!("could not parse package name/version out of '{pkg_filename}'");
+    };
     let url = format!("https://api.github.com/repos/{owner}/{name}/contents/apps.json");
-    let existing: Option<ContentEntry> = gh.get_json(&url).await.ok();
-    let mut apps: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    if let Some(e) = &existing {
-        if let Some(dl) = &e.download_url {
-            if let Ok(bytes) = gh.get_bytes(dl).await {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if let Some(obj) = v.as_object() {
-                        for (k, v) in obj {
-                            apps.insert(k.clone(), v.clone());
-                        }
-                    }
+    let existing: ContentEntry = gh.get_json(&url).await.context("fetch apps.json metadata")?;
+    let dl = existing
+        .download_url
+        .as_ref()
+        .ok_or_else(|| anyhow!("apps.json has no download_url"))?;
+    let bytes = gh.get_bytes(dl).await.context("download apps.json")?;
+    let mut data: serde_json::Value =
+        serde_json::from_slice(&bytes).context("apps.json is not valid JSON")?;
+
+    let apps = data
+        .get_mut("apps")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow!("apps.json has no \"apps\" array"))?;
+    let today = chrono::Utc::now().date_naive().to_string();
+    let download_url =
+        format!("https://github.com/{owner}/{name}/releases/download/{tag}/{pkg_filename}");
+    let new_version = serde_json::json!({
+        "version": ver,
+        "release_date": today,
+        "download_url": download_url,
+        "changelog": format!("Published from {pkg} v{ver} via zohara-updates-system"),
+    });
+
+    match apps.iter_mut().find(|a| a.get("id").and_then(|v| v.as_str()) == Some(pkg.as_str())
+        || a.get("package").and_then(|v| v.as_str()) == Some(pkg.as_str()))
+    {
+        Some(entry) => {
+            entry["current_version"] = serde_json::Value::String(ver.clone());
+            let versions = entry["versions"].as_array_mut().ok_or_else(|| anyhow!("entry has no versions array"))?;
+            match versions.iter_mut().find(|v| v.get("version").and_then(|v| v.as_str()) == Some(ver.as_str())) {
+                Some(v) => *v = new_version,
+                None => {
+                    versions.insert(0, new_version);
+                    versions.truncate(10);
                 }
             }
         }
+        None => {
+            apps.push(serde_json::json!({
+                "id": pkg,
+                "name": pkg.replace('-', " "),
+                "publisher": "Zohara OS Team",
+                "description": format!("{pkg} — published via zohara-updates-system."),
+                "category": "System",
+                "icon_url": format!(
+                    "https://raw.githubusercontent.com/{owner}/{pkg}/main/data/icons/scalable/apps/{pkg}.svg"
+                ),
+                "type": "pacman",
+                "package": pkg,
+                "current_version": ver,
+                "versions": [new_version],
+            }));
+        }
     }
-    apps.insert(
-        pkg.to_string(),
-        serde_json::json!({
-            "last_published": chrono::Utc::now().to_rfc3339(),
-            "source": "zohara-updates-system",
-            "filename": pkg_filename,
-        }),
-    );
-    let body = serde_json::to_string_pretty(&apps)?;
+
+    let body = serde_json::to_string_pretty(&data)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
 
     #[derive(Serialize)]
     struct PutFile<'a> {
         message: &'a str,
         content: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        sha: Option<&'a str>,
+        sha: &'a str,
     }
     let put = PutFile {
-        message: &format!("chore(publish): record {pkg} via zohara-updates-system"),
+        message: &format!("chore(publish): record {pkg} {ver} via zohara-updates-system"),
         content: &b64,
-        sha: existing.as_ref().map(|e| e.sha.as_str()),
+        sha: &existing.sha,
     };
     let _: serde_json::Value = gh.put_json(&url, &put).await?;
     Ok(())
@@ -841,16 +1001,26 @@ async fn main() -> Result<()> {
         cfg.private_key_pem.clone(),
     );
     let gh = Gh::new(auth);
+    // Required, not defaulted: this dashboard can push packages into the
+    // OTA channel real users' machines pull from, so there is no safe
+    // fallback credential to ship if the operator forgets to set one.
+    let auth_user = require_env("ZOHARA_HUB_ADMIN_USER")?;
+    let auth_pass = require_env("ZOHARA_HUB_ADMIN_PASS")?;
     let state = AppState {
         cfg: Arc::new(cfg),
         gh,
+        auth_user,
+        auth_pass,
     };
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/health", get(health))
         .route("/repo/:owner/:name", get(repo_view))
         .route("/publish", post(publish))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        // /health stays outside auth: hosting platforms (Render) poll it
+        // without credentials to decide whether to keep the service up.
+        .route("/health", get(health))
         .with_state(state);
 
     let port: u16 = env::var("PORT")

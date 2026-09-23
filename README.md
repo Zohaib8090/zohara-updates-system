@@ -19,10 +19,17 @@ No database, no persistent state — every page is a fresh GET.
 export ZOHARA_HUB_APP_ID=123456
 export ZOHARA_HUB_APP_PRIVATE_KEY="$(cat ~/Downloads/zohara-updates-system.2026-09-04.private-key.pem)"
 export ZOHARA_HUB_INSTALLATION_ID=78901234
+# Every route (including POST /publish) requires HTTP Basic auth with
+# these. There is no default -- the process refuses to start without
+# them, since this dashboard can push a package into the OTA channel
+# real installs pull updates from.
+export ZOHARA_HUB_ADMIN_USER=zohaib
+export ZOHARA_HUB_ADMIN_PASS="pick something long"
 cargo run --release
 ```
 
-Open http://localhost:8080.
+Open http://localhost:8080 (your browser will prompt for the Basic auth
+credentials above).
 
 ## Deploy to Render free
 
@@ -32,8 +39,10 @@ Open http://localhost:8080.
    image with `pacman` preinstalled.)
 4. Plan: **Free**.
 5. Set the env vars `ZOHARA_HUB_APP_ID`, `ZOHARA_HUB_APP_PRIVATE_KEY`
-   (paste the whole PEM), and `ZOHARA_HUB_INSTALLATION_ID` from your
-   Zohara GitHub App's installation.
+   (paste the whole PEM), `ZOHARA_HUB_INSTALLATION_ID` from your Zohara
+   GitHub App's installation, and `ZOHARA_HUB_ADMIN_USER` /
+   `ZOHARA_HUB_ADMIN_PASS` (pick your own -- these gate every route on this
+   service with HTTP Basic auth once it's live on the public internet).
 6. Deploy. The dashboard lives at `https://<service-name>.onrender.com`.
 
 ## GitHub App setup (one-time)
@@ -43,7 +52,8 @@ Open http://localhost:8080.
    - Homepage: `https://zohara-updates-system.onrender.com`
    - Webhook: **disabled** (we don't receive webhooks)
    - Repository permissions:
-     - **Contents**: Read & write (to commit `apps.json`)
+     - **Contents**: Read & write (to commit `apps.json` and upload release assets)
+     - **Actions**: Read-only (to list workflow runs and download their artifacts)
      - **Metadata**: Read-only
    - Click "Create"
 2. Generate a private key. Save the .pem file.
