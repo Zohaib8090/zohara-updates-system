@@ -30,6 +30,9 @@
       <a href="{{ repo.html_url }}">github</a></div>
   </div>
 
+  {% if !publish_enabled %}
+  <p class="err">Publishing is switched off until phase 2 of docs/PLAN.md is done. You can look, but the buttons will refuse.</p>
+  {% endif %}
   <h2>Recent successful runs</h2>
   {% if runs.is_empty() %}
   <p class="meta">No successful runs yet.</p>
@@ -44,16 +47,19 @@
       · {{ r.created_at }} · {{ r.name }}
     </div>
     <form method="post" action="/publish">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="repo" value="{{ repo.full }}">
       <input type="hidden" name="run_id" value="{{ r.id }}">
       <button type="submit" name="channel" value="stable">Publish to stable</button>
     </form>
     <form method="post" action="/publish">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="repo" value="{{ repo.full }}">
       <input type="hidden" name="run_id" value="{{ r.id }}">
       <button class="beta" type="submit" name="channel" value="beta">Publish to beta</button>
     </form>
     <form method="post" action="/publish">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="repo" value="{{ repo.full }}">
       <input type="hidden" name="run_id" value="{{ r.id }}">
       <button class="alpha" type="submit" name="channel" value="alpha">Publish to alpha</button>

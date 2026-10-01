@@ -11,21 +11,27 @@
 // short-lived JWT, exchange it for an installation token, and use
 // that to call the GitHub REST API.
 //
-// Endpoints:
+// Endpoints (everything except /health, /login and /auth/callback needs the signed-in owner, see auth.rs):
 //   GET  /                          list watched repos + recent runs
 //   GET  /repo/{owner}/{name}       single-repo view + publish buttons
-//   POST /publish                   do the publish (download -> repo-add -> upload)
+//   POST /publish                   do the publish (download -> repo-add -> upload); off until phase 2
+//   GET  /login, /auth/callback     sign in with GitHub (only ZOHARA_HUB_ALLOWED_USER_ID gets in)
+//   POST /logout
 //
-// State: none. All authoritative state is GitHub.
+// State: none. All authoritative state is GitHub; the session is a signed cookie.
+// See docs/PLAN.md for where this is going.
+
+mod auth;
 
 use anyhow::{anyhow, bail, Context, Result};
 use askama::Template;
 use axum::{
-    extract::{Form, Path, State},
-    http::StatusCode,
+    extract::{Form, Path, Query, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -42,6 +48,14 @@ struct AppConfig {
     private_key_pem: String,
     watched_repos: Vec<(String, String)>, // (owner, name)
     pkg_repo: (String, String),           // (owner, name)
+    // Login (see auth.rs)
+    client_id: String,
+    client_secret: String,
+    session_secret: Vec<u8>,
+    allowed_user_id: u64,
+    base_url: String, // public address, e.g. https://zohara-updates-system.onrender.com (no trailing slash)
+    // Publishing stays off until phase 2 (the publish code below still replaces the whole package database).
+    publish_enabled: bool,
 }
 
 impl AppConfig {
@@ -64,12 +78,24 @@ impl AppConfig {
             env::var("ZOHARA_HUB_PKG_REPO")
                 .unwrap_or_else(|_| "zohara-packages".into()),
         );
+        let session_secret = require_env("ZOHARA_HUB_SESSION_SECRET")?.into_bytes();
+        if session_secret.len() < 32 {
+            bail!("ZOHARA_HUB_SESSION_SECRET must be at least 32 characters");
+        }
         Ok(Self {
             app_id,
             installation_id,
             private_key_pem,
             watched_repos: watched,
             pkg_repo,
+            client_id: require_env("ZOHARA_HUB_CLIENT_ID")?,
+            client_secret: require_env("ZOHARA_HUB_CLIENT_SECRET")?,
+            session_secret,
+            allowed_user_id: require_env("ZOHARA_HUB_ALLOWED_USER_ID")?
+                .parse()
+                .context("ZOHARA_HUB_ALLOWED_USER_ID is not a number")?,
+            base_url: require_env("ZOHARA_HUB_BASE_URL")?.trim_end_matches('/').to_string(),
+            publish_enabled: env::var("ZOHARA_HUB_PUBLISH_ENABLED").map(|v| v == "1").unwrap_or(false),
         })
     }
 }
@@ -382,6 +408,32 @@ struct WorkflowRun {
     created_at: String,
     updated_at: String,
     html_url: String,
+    #[serde(default)]
+    head_repository: Option<RunRepo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RunRepo {
+    full_name: String,
+}
+
+/// A run may be published only if it is a finished, successful build of the watched repo itself, from its `main`
+/// branch, started by a push or by hand. This refuses pull-request runs (a fork can run a workflow too), runs on
+/// other branches and runs of any other repository.
+fn run_is_publishable(run: &WorkflowRun, repo_full: &str) -> Result<(), String> {
+    if run.status != "completed" || run.conclusion.as_deref() != Some("success") {
+        return Err("that run did not finish successfully".into());
+    }
+    if run.head_branch != "main" {
+        return Err(format!("that run is from branch `{}`, only `main` can be published", run.head_branch));
+    }
+    if run.event != "push" && run.event != "workflow_dispatch" {
+        return Err(format!("that run was started by `{}`, only push or manual runs can be published", run.event));
+    }
+    match &run.head_repository {
+        Some(r) if r.full_name.eq_ignore_ascii_case(repo_full) => Ok(()),
+        _ => Err("that run does not come from the watched repository itself".into()),
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -441,6 +493,7 @@ struct IndexTpl<'a> {
     title: &'a str,
     repos: &'a [RepoSummary],
     err: Option<&'a str>,
+    csrf: &'a str,
 }
 
 #[derive(Template)]
@@ -449,6 +502,8 @@ struct RepoTpl<'a> {
     title: &'a str,
     repo: &'a RepoSummary,
     runs: &'a [WorkflowRun],
+    csrf: &'a str,
+    publish_enabled: bool,
 }
 
 #[derive(Template)]
@@ -482,6 +537,19 @@ struct PublishForm {
     repo: String,
     run_id: u64,
     channel: String,
+    csrf: String,
+}
+
+#[derive(Deserialize)]
+struct CsrfForm {
+    csrf: String,
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────
@@ -503,7 +571,7 @@ fn render_html<T: Template>(t: T) -> Response {
     }
 }
 
-async fn index(State(s): State<AppState>) -> Response {
+async fn index(State(s): State<AppState>, Extension(sess): Extension<auth::Session>) -> Response {
     let mut summaries = Vec::new();
     for (owner, name) in &s.cfg.watched_repos {
         let url = format!("https://api.github.com/repos/{owner}/{name}");
@@ -526,14 +594,19 @@ async fn index(State(s): State<AppState>) -> Response {
         title: "zohara-updates-system",
         repos: &summaries,
         err: None,
+        csrf: &sess.csrf,
     })
 }
 
 async fn repo_view(
     State(s): State<AppState>,
+    Extension(sess): Extension<auth::Session>,
     Path((owner, name)): Path<(String, String)>,
 ) -> Response {
     let full = format!("{owner}/{name}");
+    if !is_watched(&s.cfg, &owner, &name) {
+        return (StatusCode::NOT_FOUND, "not a watched repository\n").into_response();
+    }
     let repo_url = format!("https://api.github.com/repos/{full}");
     let runs_url = format!(
         "https://api.github.com/repos/{full}/actions/runs?per_page=15&status=success"
@@ -561,14 +634,182 @@ async fn repo_view(
         title: "zohara-updates-system",
         repo: &summary,
         runs: &runs.workflow_runs,
+        csrf: &sess.csrf,
+        publish_enabled: s.cfg.publish_enabled,
     })
+}
+
+fn is_watched(cfg: &AppConfig, owner: &str, name: &str) -> bool {
+    cfg.watched_repos
+        .iter()
+        .any(|(o, n)| o.eq_ignore_ascii_case(owner) && n.eq_ignore_ascii_case(name))
 }
 
 async fn publish(
     State(s): State<AppState>,
+    Extension(sess): Extension<auth::Session>,
     Form(f): Form<PublishForm>,
 ) -> Response {
+    if !auth::same(&f.csrf, &sess.csrf) {
+        return (StatusCode::FORBIDDEN, "bad or missing CSRF token\n").into_response();
+    }
+    if !s.cfg.publish_enabled {
+        return err_page("Publishing is switched off until phase 2 of docs/PLAN.md is done.");
+    }
+    let (owner, name) = match f.repo.split_once('/') {
+        Some((o, n)) => (o.to_owned(), n.to_owned()),
+        None => return err_page("repo must be owner/name"),
+    };
+    // Only the watched repositories, never whatever the form says.
+    if !is_watched(&s.cfg, &owner, &name) {
+        return (StatusCode::FORBIDDEN, "not a watched repository\n").into_response();
+    }
+    let run_url = format!("https://api.github.com/repos/{owner}/{name}/actions/runs/{}", f.run_id);
+    let run: WorkflowRun = match s.gh.get_json(&run_url).await {
+        Ok(r) => r,
+        Err(e) => return err_page(&format!("look up run {}: {e:#}", f.run_id)),
+    };
+    if let Err(why) = run_is_publishable(&run, &format!("{owner}/{name}")) {
+        return err_page(&why);
+    }
     do_publish(s, f).await
+}
+
+// ── Login ───────────────────────────────────────────────────────────────
+
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn cookie_from(req: &Request, name: &str) -> Option<String> {
+    let h = req.headers().get(header::COOKIE)?.to_str().ok()?;
+    auth::cookie_value(h, name).map(|v| v.to_string())
+}
+
+fn with_cookies(mut resp: Response, cookies: &[String]) -> Response {
+    for c in cookies {
+        if let Ok(v) = HeaderValue::from_str(c) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+/// Everything behind this needs the signed-in owner. Browsers get sent to /login, anything else gets 401.
+async fn require_login(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
+    let session = cookie_from(&req, auth::SESSION_COOKIE)
+        .and_then(|v| auth::read_session(&s.cfg.session_secret, &v, now_unix(), s.cfg.allowed_user_id));
+    match session {
+        Some(sess) => {
+            req.extensions_mut().insert(sess);
+            let mut resp = next.run(req).await;
+            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            resp
+        }
+        None => {
+            if req.method() == axum::http::Method::GET {
+                Redirect::to("/login").into_response()
+            } else {
+                (StatusCode::UNAUTHORIZED, "sign in first\n").into_response()
+            }
+        }
+    }
+}
+
+async fn login(State(s): State<AppState>) -> Response {
+    let state = auth::random_token();
+    let url = format!(
+        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}",
+        urlencode(&s.cfg.client_id),
+        urlencode(&format!("{}/auth/callback", s.cfg.base_url)),
+        urlencode(&state),
+    );
+    let sealed = auth::seal(&s.cfg.session_secret, &state);
+    with_cookies(
+        Redirect::to(&url).into_response(),
+        &[auth::set_cookie(auth::STATE_COOKIE, &sealed, auth::STATE_SECONDS)],
+    )
+}
+
+async fn auth_callback(State(s): State<AppState>, Query(q): Query<CallbackQuery>, req: Request) -> Response {
+    let denied = |msg: &str| {
+        with_cookies(
+            (StatusCode::FORBIDDEN, format!("{msg}\n")).into_response(),
+            &[auth::clear_cookie(auth::STATE_COOKIE)],
+        )
+    };
+    if q.error.is_some() {
+        return denied("GitHub sign-in was cancelled");
+    }
+    let (Some(code), Some(state)) = (q.code, q.state) else {
+        return denied("missing code or state");
+    };
+    // The `state` must be the one this browser was given at /login.
+    let expected = cookie_from(&req, auth::STATE_COOKIE).and_then(|v| auth::open(&s.cfg.session_secret, &v));
+    if !expected.map(|e| auth::same(&e, &state)).unwrap_or(false) {
+        return denied("sign-in state does not match, start again at /login");
+    }
+    let user_id = match github_user_id(&s.cfg, &code).await {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!("sign-in failed: {e:#}");
+            return denied("could not complete the GitHub sign-in");
+        }
+    };
+    if user_id != s.cfg.allowed_user_id {
+        log::warn!("sign-in refused for GitHub user id {user_id}");
+        return denied("this GitHub account is not allowed here");
+    }
+    let (cookie, _csrf) = auth::make_session_cookie_value(&s.cfg.session_secret, user_id, now_unix());
+    with_cookies(
+        Redirect::to("/").into_response(),
+        &[
+            auth::set_cookie(auth::SESSION_COOKIE, &cookie, auth::SESSION_SECONDS),
+            auth::clear_cookie(auth::STATE_COOKIE),
+        ],
+    )
+}
+
+/// Trades the one-time `code` for a user token, then asks GitHub who that is. The token is dropped right away.
+async fn github_user_id(cfg: &AppConfig, code: &str) -> Result<u64> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let tok: serde_json::Value = client
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .header("User-Agent", "zohara-updates-system")
+        .form(&[
+            ("client_id", cfg.client_id.as_str()),
+            ("client_secret", cfg.client_secret.as_str()),
+            ("code", code),
+            ("redirect_uri", &format!("{}/auth/callback", cfg.base_url)),
+        ])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let access = tok
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("no access_token in GitHub's answer"))?;
+    let user: serde_json::Value = client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {access}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "zohara-updates-system")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    user.get("id").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("no id in GitHub's /user answer"))
+}
+
+async fn logout(Extension(sess): Extension<auth::Session>, Form(f): Form<CsrfForm>) -> Response {
+    if !auth::same(&f.csrf, &sess.csrf) {
+        return (StatusCode::FORBIDDEN, "bad or missing CSRF token\n").into_response();
+    }
+    with_cookies(Redirect::to("/login").into_response(), &[auth::clear_cookie(auth::SESSION_COOKIE)])
 }
 
 async fn do_publish(s: AppState, f: PublishForm) -> Response {
@@ -818,15 +1059,12 @@ async fn update_apps_json(
     Ok(())
 }
 
-// ── Health / fallback ───────────────────────────────────────────────────
+// ── Health ───────────────────────────────────────────────────
 
 async fn health() -> &'static str {
     "ok\n"
 }
 
-async fn root_fallback() -> Redirect {
-    Redirect::to("/")
-}
 
 // ── Main ────────────────────────────────────────────────────────────────
 
@@ -846,12 +1084,18 @@ async fn main() -> Result<()> {
         gh,
     };
 
-    let app = Router::new()
+    // Anything added to `protected` is behind the login; only the three routes in `open` are public.
+    let protected = Router::new()
         .route("/", get(index))
-        .route("/health", get(health))
         .route("/repo/:owner/:name", get(repo_view))
         .route("/publish", post(publish))
-        .with_state(state);
+        .route("/logout", post(logout))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_login));
+    let open = Router::new()
+        .route("/health", get(health))
+        .route("/login", get(login))
+        .route("/auth/callback", get(auth_callback));
+    let app = Router::new().merge(protected).merge(open).with_state(state);
 
     let port: u16 = env::var("PORT")
         .ok()
@@ -863,4 +1107,54 @@ async fn main() -> Result<()> {
     log::info!("zohara-updates-system listening on 0.0.0.0:{port}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(branch: &str, event: &str, status: &str, conclusion: Option<&str>, repo: Option<&str>) -> WorkflowRun {
+        WorkflowRun {
+            id: 1,
+            name: "Build".into(),
+            head_branch: branch.into(),
+            head_sha: "0123456789abcdef".into(),
+            display_title: "t".into(),
+            status: status.into(),
+            conclusion: conclusion.map(Into::into),
+            event: event.into(),
+            created_at: "x".into(),
+            updated_at: "x".into(),
+            html_url: "x".into(),
+            head_repository: repo.map(|r| RunRepo { full_name: r.into() }),
+        }
+    }
+
+    const REPO: &str = "Zohaib8090/zohara-settings";
+
+    #[test]
+    fn good_run_is_publishable() {
+        assert!(run_is_publishable(&run("main", "push", "completed", Some("success"), Some(REPO)), REPO).is_ok());
+        assert!(run_is_publishable(&run("main", "workflow_dispatch", "completed", Some("success"), Some("zohaib8090/ZOHARA-settings")), REPO).is_ok());
+    }
+
+    #[test]
+    fn bad_runs_are_refused() {
+        let bad = [
+            run("feature", "push", "completed", Some("success"), Some(REPO)),
+            run("main", "pull_request", "completed", Some("success"), Some(REPO)),
+            run("main", "push", "completed", Some("failure"), Some(REPO)),
+            run("main", "push", "in_progress", None, Some(REPO)),
+            run("main", "push", "completed", Some("success"), Some("attacker/zohara-settings")),
+            run("main", "push", "completed", Some("success"), None),
+        ];
+        for r in bad {
+            assert!(run_is_publishable(&r, REPO).is_err(), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn urlencode_escapes() {
+        assert_eq!(urlencode("a b&c"), "a%20b%26c");
+    }
 }

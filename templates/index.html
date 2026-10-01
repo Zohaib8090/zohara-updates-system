@@ -14,10 +14,12 @@
     .name { font-size:1.1rem; font-weight:600; }
     .desc { color:#8b949e; font-size:0.9rem; margin:0.4rem 0; }
     .meta { color:#8b949e; font-size:0.85rem; }
+    button { background:#30363d; color:#c9d1d9; border:0; border-radius:6px; padding:0.4rem 0.8rem; cursor:pointer; }
     .err { background:#3d1d1d; border:1px solid #f85149; padding:1rem; border-radius:6px; }
   </style>
 </head>
 <body>
+  <form method="post" action="/logout" style="float:right"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">Sign out</button></form>
   <h1>{{ title }}</h1>
   <p>Watched package repos. Click to view recent builds and publish.</p>
   {% if let Some(e) = err %}

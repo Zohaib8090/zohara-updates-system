@@ -13,16 +13,35 @@ release, and commits `apps.json` back.
 
 No database, no persistent state — every page is a fresh GET.
 
-## Run locally
+## Sign-in (since 2026-10-01)
+
+Every page except `/health`, `/login` and `/auth/callback` needs a GitHub sign-in, and only one numeric GitHub user
+id gets in. **Publishing is switched off** (`ZOHARA_HUB_PUBLISH_ENABLED` unset) until phase 2 of
+[docs/PLAN.md](docs/PLAN.md): the old publish code replaces the whole package database. Read the plan before
+turning it on.
+
+| Env var | What |
+|---|---|
+| `ZOHARA_HUB_APP_ID`, `ZOHARA_HUB_INSTALLATION_ID`, `ZOHARA_HUB_APP_PRIVATE_KEY` | the GitHub App (reads runs and artifacts) |
+| `ZOHARA_HUB_CLIENT_ID`, `ZOHARA_HUB_CLIENT_SECRET` | the same App's OAuth credentials (for sign-in) |
+| `ZOHARA_HUB_ALLOWED_USER_ID` | numeric id of the only account allowed in (`gh api users/Zohaib8090 --jq .id`) |
+| `ZOHARA_HUB_SESSION_SECRET` | 32+ random characters that sign the session cookie |
+| `ZOHARA_HUB_BASE_URL` | the public address, no trailing slash (for the OAuth callback) |
+| `ZOHARA_HUB_PUBLISH_ENABLED` | `1` to allow `/publish` (leave unset for now) |
+
+In the GitHub App's settings add the **Callback URL** `<ZOHARA_HUB_BASE_URL>/auth/callback` and generate a client
+secret. Never put these values in the repo. Cookies are `Secure`, so sign-in only works over https (Render, or
+a local https proxy).
+
+## Run the tests
 
 ```bash
-export ZOHARA_HUB_APP_ID=123456
-export ZOHARA_HUB_APP_PRIVATE_KEY="$(cat ~/Downloads/zohara-updates-system.2026-09-04.private-key.pem)"
-export ZOHARA_HUB_INSTALLATION_ID=78901234
-cargo run --release
+cargo test
 ```
 
-Open http://localhost:8080.
+The tests cover the session cookie (forged, expired, wrong user, wrong key) and which workflow runs may be
+published. The route checks (no cookie, wrong cookie, wrong CSRF token, unwatched repo) were run by hand against a
+local build on 2026-10-01; see docs/PLAN.md, phase 1.
 
 ## Deploy to Render free
 
