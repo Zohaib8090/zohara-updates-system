@@ -28,10 +28,19 @@ turning it on.
 | `ZOHARA_HUB_SESSION_SECRET` | 32+ random characters that sign the session cookie |
 | `ZOHARA_HUB_BASE_URL` | the public address, no trailing slash (for the OAuth callback) |
 | `ZOHARA_HUB_PUBLISH_ENABLED` | `1` to allow `/publish` (leave unset for now) |
+| `ZOHARA_HUB_SELF_PING` | `0` to turn off the keep-awake ping (on by default; see below) |
 
 In the GitHub App's settings add the **Callback URL** `<ZOHARA_HUB_BASE_URL>/auth/callback` and generate a client
 secret. Never put these values in the repo. Cookies are `Secure`, so sign-in only works over https (Render, or
 a local https proxy).
+
+## Keeping it awake on Render's free plan
+
+Free web services sleep after 15 minutes without requests. The app calls its own public `/health` (from
+`ZOHARA_HUB_BASE_URL`) every 10 minutes so Render sees traffic. Limits: it cannot wake a service that is already
+asleep or suspended, and one always-on service uses about 730 of the 750 free instance hours a month, so it
+leaves almost no room for a second always-on free service in the same workspace. If it still goes down, check
+the service's Logs on Render: a crash at startup (missing environment variable) looks the same as sleeping.
 
 ## Run the tests
 

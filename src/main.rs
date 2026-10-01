@@ -1066,6 +1066,40 @@ async fn health() -> &'static str {
 }
 
 
+// ── Keep-awake ──────────────────────────────────────────────────────────
+
+/// Render's free web services go to sleep after 15 minutes without incoming requests. Calling our own public
+/// address (not localhost: the request has to come in through Render's front door to count) every 10 minutes
+/// keeps this one awake while it is running. It cannot wake a service that is already asleep or suspended, and it
+/// uses free instance hours (about 730 a month for one always-on service, the free allowance is 750).
+/// Switch off with ZOHARA_HUB_SELF_PING=0.
+fn spawn_self_ping(base_url: String) {
+    if env::var("ZOHARA_HUB_SELF_PING").map(|v| v == "0").unwrap_or(false) {
+        log::info!("self-ping is off");
+        return;
+    }
+    let url = format!("{base_url}/health");
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder().timeout(Duration::from_secs(20)).build() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("self-ping disabled: {e}");
+                return;
+            }
+        };
+        // Let the server finish starting before the first call.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        loop {
+            match client.get(&url).header("User-Agent", "zohara-updates-system self-ping").send().await {
+                Ok(r) if r.status().is_success() => log::debug!("self-ping ok"),
+                Ok(r) => log::warn!("self-ping got HTTP {}", r.status()),
+                Err(e) => log::warn!("self-ping failed: {e}"),
+            }
+            tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+        }
+    });
+}
+
 // ── Main ────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1079,6 +1113,7 @@ async fn main() -> Result<()> {
         cfg.private_key_pem.clone(),
     );
     let gh = Gh::new(auth);
+    let base_url_for_ping = cfg.base_url.clone();
     let state = AppState {
         cfg: Arc::new(cfg),
         gh,
@@ -1105,6 +1140,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind 0.0.0.0:{port}"))?;
     log::info!("zohara-updates-system listening on 0.0.0.0:{port}");
+    spawn_self_ping(base_url_for_ping);
     axum::serve(listener, app).await?;
     Ok(())
 }
