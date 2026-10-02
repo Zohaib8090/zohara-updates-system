@@ -33,10 +33,9 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
-use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 // ── App config from env vars ────────────────────────────────────────────
@@ -225,153 +224,21 @@ impl Gh {
         Ok(resp.json().await?)
     }
 
-    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+    /// POST a JSON body; returns the HTTP status and the body text (GitHub answers 204 with no body on success).
+    async fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<(reqwest::StatusCode, String)> {
         let auth = self.auth_header().await?;
         let resp = self
             .client
-            .get(url)
-            .header("Authorization", auth)
-            .header("Accept", "application/octet-stream")
-            .header("User-Agent", "zohara-updates-system")
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url} non-2xx"))?;
-        Ok(resp.bytes().await?.to_vec())
-    }
-
-    /// Like `get_bytes` but uses the vnd.github+json Accept header.
-    /// Required for artifact zip downloads — the redirected S3 endpoint
-    /// rejects `Accept: application/octet-stream` with 415.
-    async fn get_bytes_json_accept(&self, url: &str) -> Result<Vec<u8>> {
-        let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .get(url)
-            .header("Authorization", auth)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "zohara-updates-system")
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url} non-2xx"))?;
-        Ok(resp.bytes().await?.to_vec())
-    }
-
-    async fn put_json<B: Serialize, T: for<'de> Deserialize<'de>>(
-        &self,
-        url: &str,
-        body: &B,
-    ) -> Result<T> {
-        let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .put(url)
+            .post(url)
             .header("Authorization", auth)
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "zohara-updates-system")
             .json(body)
             .send()
             .await
-            .with_context(|| format!("PUT {url}"))?
-            .error_for_status()
-            .with_context(|| format!("PUT {url} non-2xx"))?;
-        Ok(resp.json().await?)
-    }
-
-    async fn delete(&self, url: &str) -> Result<()> {
-        let auth = self.auth_header().await?;
-        self.client
-            .delete(url)
-            .header("Authorization", auth)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "zohara-updates-system")
-            .send()
-            .await
-            .with_context(|| format!("DELETE {url}"))?
-            .error_for_status()
-            .with_context(|| format!("DELETE {url} non-2xx"))?;
-        Ok(())
-    }
-
-    async fn upload_asset(
-        &self,
-        release_upload_url: &str,
-        name: &str,
-        bytes: &[u8],
-    ) -> Result<()> {
-        // The upload URL from GitHub looks like:
-        //   https://uploads.github.com/.../releases/.../assets{?name,label}
-        // It's a URI template -- strip the {?name,label} suffix and
-        // append our own ?name=... .
-        let base = release_upload_url
-            .split('{')
-            .next()
-            .unwrap_or(release_upload_url);
-        let url = format!("{base}?name={}", urlencode(name));
-        let auth = self.auth_header().await?;
-
-        // Step 1: POST to api.github.com / uploads.github.com with the
-        // raw file body. GitHub returns 302 with a Location header
-        // pointing to S3 (pre-signed). We do NOT follow the redirect;
-        // reqwest strips the body on 302 and that breaks S3.
-        let no_redirect = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("build no-redirect client")?;
-        let resp = no_redirect
-            .post(&url)
-            .header("Authorization", auth)
-            .header("Accept", "*/*")
-            .header("User-Agent", "zohara-updates-system")
-            .header("Content-Type", "application/octet-stream")
-            .body(bytes.to_vec())
-            .send()
-            .await
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
-        // 200/201 = direct success (some old releases don't redirect)
-        if status.is_success() {
-            return Ok(());
-        }
-        // 302 = GitHub returned the S3 URL
-        if status != reqwest::StatusCode::FOUND && status != reqwest::StatusCode::TEMPORARY_REDIRECT {
-            let t = resp.text().await.unwrap_or_default();
-            bail!("upload asset `{name}` step 1: HTTP {status} body={t}");
-        }
-        let s3_url = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| anyhow!("no Location header on 302"))?
-            .to_string();
-
-        // Step 2: PUT the body to S3. No auth needed (URL is pre-signed).
-        // No Accept: application/vnd.github+json header either, just like
-        // GitHub's docs say for S3 upload.
-        let s3_resp = no_redirect
-            .put(&s3_url)
-            .header("Content-Type", "application/octet-stream")
-            .body(bytes.to_vec())
-            .send()
-            .await
-            .with_context(|| format!("PUT {s3_url}"))?;
-        let s3_status = s3_resp.status();
-        if !s3_status.is_success() {
-            let t = s3_resp.text().await.unwrap_or_default();
-            bail!("upload asset `{name}` step 2: HTTP {s3_status} body={t}");
-        }
-        Ok(())
-    }
-
-    async fn delete_asset_by_id(&self, owner: &str, name: &str, asset_id: u64) -> Result<()> {
-        self.delete(&format!(
-            "https://api.github.com/repos/{owner}/{name}/releases/assets/{asset_id}"
-        ))
-        .await
+        Ok((status, resp.text().await.unwrap_or_default()))
     }
 }
 
@@ -452,37 +319,11 @@ struct Artifact {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Release {
-    id: u64,
-    tag_name: String,
-    name: String,
-    upload_url: String,
-    html_url: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 struct RepoInfo {
     full_name: String,
     description: Option<String>,
     stargazers_count: u64,
     open_issues_count: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ReleaseAsset {
-    id: u64,
-    name: String,
-    url: String,
-    browser_download_url: String,
-    size: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ContentEntry {
-    name: String,
-    path: String,
-    sha: String,
-    download_url: Option<String>,
 }
 
 // ── HTML templates (askama) ─────────────────────────────────────────────
@@ -504,6 +345,8 @@ struct RepoTpl<'a> {
     runs: &'a [WorkflowRun],
     csrf: &'a str,
     publish_enabled: bool,
+    notice: Option<&'a str>,
+    actions_url: &'a str,
 }
 
 #[derive(Template)]
@@ -538,6 +381,11 @@ struct PublishForm {
     run_id: u64,
     channel: String,
     csrf: String,
+}
+
+#[derive(Deserialize)]
+struct RepoQuery {
+    notice: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -602,6 +450,7 @@ async fn repo_view(
     State(s): State<AppState>,
     Extension(sess): Extension<auth::Session>,
     Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<RepoQuery>,
 ) -> Response {
     let full = format!("{owner}/{name}");
     if !is_watched(&s.cfg, &owner, &name) {
@@ -636,6 +485,15 @@ async fn repo_view(
         runs: &runs.workflow_runs,
         csrf: &sess.csrf,
         publish_enabled: s.cfg.publish_enabled,
+        // Only known keys become text; nothing from the URL is shown as it is.
+        notice: match q.notice.as_deref() {
+            Some("started") => Some("Publish started. It takes a minute or two; follow it on the Actions page below."),
+            _ => None,
+        },
+        actions_url: &format!(
+            "https://github.com/{}/{}/actions/workflows/publish.yml",
+            s.cfg.pkg_repo.0, s.cfg.pkg_repo.1
+        ),
     })
 }
 
@@ -654,7 +512,7 @@ async fn publish(
         return (StatusCode::FORBIDDEN, "bad or missing CSRF token\n").into_response();
     }
     if !s.cfg.publish_enabled {
-        return err_page("Publishing is switched off until phase 2 of docs/PLAN.md is done.");
+        return err_page("Publishing is switched off (ZOHARA_HUB_PUBLISH_ENABLED is not 1).");
     }
     let (owner, name) = match f.repo.split_once('/') {
         Some((o, n)) => (o.to_owned(), n.to_owned()),
@@ -672,7 +530,47 @@ async fn publish(
     if let Err(why) = run_is_publishable(&run, &format!("{owner}/{name}")) {
         return err_page(&why);
     }
-    do_publish(s, f).await
+    let channel = f.channel.to_lowercase();
+    if !["stable", "beta", "alpha"].contains(&channel.as_str()) {
+        return err_page(&format!("invalid channel: {channel}"));
+    }
+    // The run must still have an artifact to publish (GitHub deletes them after a while).
+    let arts_url = format!("https://api.github.com/repos/{owner}/{name}/actions/runs/{}/artifacts", f.run_id);
+    let arts: Artifacts = match s.gh.get_json(&arts_url).await {
+        Ok(a) => a,
+        Err(e) => return err_page(&format!("list artifacts of run {}: {e:#}", f.run_id)),
+    };
+    let live: Vec<&Artifact> = arts.artifacts.iter().filter(|a| !a.expired).collect();
+    if live.is_empty() {
+        return err_page("this run has no downloadable artifacts left (GitHub deletes them after a while)");
+    }
+    let artifact_name = if live.len() == 1 { Some(live[0].name.as_str()) } else { None };
+    // The publishing itself runs in GitHub Actions (zohara-packages/.github/workflows/publish.yml), which checks
+    // everything again. This site only chooses the run and the channel and starts it.
+    let body = dispatch_body(&format!("{owner}/{name}"), f.run_id, &channel, artifact_name);
+    let url = format!("https://api.github.com/repos/{}/{}/dispatches", s.cfg.pkg_repo.0, s.cfg.pkg_repo.1);
+    match s.gh.post_json(&url, &body).await {
+        Ok((st, _)) if st == StatusCode::NO_CONTENT => {
+            log::info!("publish started: {owner}/{name} run {} -> {channel}", f.run_id);
+            Redirect::to(&format!("/repo/{owner}/{name}?notice=started")).into_response()
+        }
+        Ok((st, text)) => err_page(&format!("GitHub refused to start the publish: HTTP {st} {text}")),
+        Err(e) => err_page(&format!("could not reach GitHub: {e:#}")),
+    }
+}
+
+/// The `repository_dispatch` body that starts zohara-packages' publish workflow.
+fn dispatch_body(source_repo: &str, run_id: u64, channel: &str, artifact_name: Option<&str>) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "source_repo": source_repo,
+        "channel": channel,
+        "requested_via": "zohara-updates-system",
+    });
+    if let Some(a) = artifact_name {
+        payload["artifact_name"] = a.into();
+    }
+    serde_json::json!({ "event_type": "package-published", "client_payload": payload })
 }
 
 // ── Login ───────────────────────────────────────────────────────────────
@@ -812,253 +710,6 @@ async fn logout(Extension(sess): Extension<auth::Session>, Form(f): Form<CsrfFor
     with_cookies(Redirect::to("/login").into_response(), &[auth::clear_cookie(auth::SESSION_COOKIE)])
 }
 
-async fn do_publish(s: AppState, f: PublishForm) -> Response {
-    let (owner, name) = match f.repo.split_once('/') {
-        Some(p) => p.to_owned(),
-        None => return err_page("repo must be owner/name"),
-    };
-    let channel = f.channel.to_lowercase();
-    if !["stable", "beta", "alpha"].contains(&channel.as_str()) {
-        return err_page(&format!("invalid channel: {channel}"));
-    }
-    let pkg_repo = (s.cfg.pkg_repo.0.clone(), s.cfg.pkg_repo.1.clone());
-
-    // 1. List the run's artifacts. We accept ANY artifact (not just one
-    //    named *.pkg.tar.zst) because some workflows upload a generic
-    //    name like "zohara-settings-arch-x86_64" containing the package
-    //    inside as a zip.
-    let arts_url = format!(
-        "https://api.github.com/repos/{owner}/{name}/actions/runs/{}/artifacts",
-        f.run_id
-    );
-    let arts: Artifacts = match s.gh.get_json(&arts_url).await {
-        Ok(x) => x,
-        Err(e) => return err_page(&format!("list artifacts: {e:#}")),
-    };
-    let art = match arts.artifacts.into_iter().next() {
-        Some(x) => x,
-        None => return err_page("no artifacts on this run"),
-    };
-
-    // 2. Download the artifact (it's a zip wrapping the .pkg.tar.zst)
-    let zip_bytes = match s.gh.get_bytes_json_accept(&art.archive_download_url).await {
-        Ok(x) => x,
-        Err(e) => return err_page(&format!("download artifact: {e:#}")),
-    };
-    let work = env::temp_dir().join(format!("zohara-pub-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    if let Err(e) = std::fs::create_dir_all(&work) {
-        return err_page(&format!("mkdir work: {e}"));
-    }
-    let zip_path = work.join("artifact.zip");
-    if let Err(e) = std::fs::write(&zip_path, &zip_bytes) {
-        return err_page(&format!("write zip: {e}"));
-    }
-
-    // 3. Unzip and locate the .pkg.tar.zst inside
-    let extract = work.join("extract");
-    std::fs::create_dir_all(&extract).ok();
-    let zip_status = std::process::Command::new("unzip")
-        .arg("-o")
-        .arg(&zip_path)
-        .arg("-d")
-        .arg(&extract)
-        .output();
-    let zip_ok = match zip_status {
-        Ok(o) if o.status.success() => true,
-        _ => false,
-    };
-    if !zip_ok {
-        return err_page("artifact is not a zip (no `unzip` or invalid format)");
-    }
-    let pkg_path = match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("find {} -type f -name '*.pkg.tar.zst' | head -1", extract.display()))
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if p.is_empty() {
-                return err_page("no .pkg.tar.zst found inside artifact zip");
-            }
-            std::path::PathBuf::from(p)
-        }
-        _ => return err_page("find .pkg.tar.zst failed"),
-    };
-    let pkg_name = pkg_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("package.pkg.tar.zst")
-        .to_string();
-
-    // 3. Get/create the channel release
-    let tag = if channel == "stable" {
-        "stable".to_string()
-    } else {
-        format!("channel-{channel}")
-    };
-    let release = match ensure_release(&s.gh, &pkg_repo.0, &pkg_repo.1, &tag, &channel).await {
-        Ok(r) => r,
-        Err(e) => return err_page(&format!("ensure release: {e:#}")),
-    };
-
-    // 4. Find existing zohara.db asset (if any) and replace it
-    let assets: Vec<ReleaseAsset> = match s.gh.get_json(&format!(
-        "https://api.github.com/repos/{}/{}/releases/{}/assets",
-        pkg_repo.0, pkg_repo.1, release.id
-    )).await {
-        Ok(x) => x,
-        Err(e) => return err_page(&format!("list release assets: {e:#}")),
-    };
-    // Match the db by its base name, regardless of compression
-    // extension (zohara.db, zohara.db.tar.gz, zohara.db.tar.zst, ...).
-    let db_asset = assets
-        .iter()
-        .find(|a| a.name == "zohara.db" || a.name.starts_with("zohara.db."))
-        .cloned();
-    let pkg_asset = assets.iter().find(|a| a.name == pkg_name).cloned();
-    // 4b. Also delete any leftover .pkg.tar.zst files for the same package
-    // version (rare, but happens if the same version was previously published
-    // under a slightly different name).
-
-    // 5. Run repo-add to add the package to the local db
-    let out = match std::process::Command::new("repo-add")
-        .current_dir(&work)
-        .arg("zohara.db.tar.zst")
-        .arg(&pkg_path)
-        .output() {
-        Ok(o) => o,
-        Err(e) => return err_page(&format!("repo-add: {e}")),
-    };
-    if !out.status.success() {
-        return err_page(&format!(
-            "repo-add failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let new_db = match std::fs::read(work.join("zohara.db.tar.zst")) {
-        Ok(b) => b,
-        Err(e) => return err_page(&format!("read new zohara.db: {e}")),
-    };
-
-    // 6. Delete old assets (so we can re-upload with same name)
-    if let Some(a) = &db_asset {
-        if let Err(e) = s.gh.delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id).await {
-            return err_page(&format!("delete old db asset: {e:#}"));
-        }
-    }
-    if let Some(a) = &pkg_asset {
-        if pkg_asset.as_ref().map(|x| x.id) != db_asset.as_ref().map(|x| x.id) {
-            if let Err(e) = s.gh.delete_asset_by_id(&pkg_repo.0, &pkg_repo.1, a.id).await {
-                return err_page(&format!("delete old pkg: {e:#}"));
-            }
-        }
-    }
-
-    // 7. Upload the new db and the new package
-    let pkg_upload_bytes = match std::fs::read(&pkg_path) {
-        Ok(b) => b,
-        Err(e) => return err_page(&format!("read pkg for upload: {e}")),
-    };
-    if let Err(e) = s.gh.upload_asset(&release.upload_url, "zohara.db.tar.zst", &new_db).await {
-        return err_page(&format!("upload zohara.db.tar.zst: {e:#}"));
-    }
-    if let Err(e) = s.gh.upload_asset(&release.upload_url, &pkg_name, &pkg_upload_bytes).await {
-        return err_page(&format!("upload pkg: {e:#}"));
-    }
-
-    // 8. Update apps.json in the package repo
-    if let Err(e) = update_apps_json(&s.gh, &pkg_repo.0, &pkg_repo.1, &pkg_name).await {
-        log::warn!("apps.json update skipped: {e:#}");
-    }
-
-    Redirect::to(&format!("/repo/{owner}/{name}")).into_response()
-}
-
-async fn ensure_release(
-    gh: &Gh,
-    owner: &str,
-    name: &str,
-    tag: &str,
-    channel: &str,
-) -> Result<Release> {
-    let by_tag = format!("https://api.github.com/repos/{owner}/{name}/releases/tags/{tag}");
-    if let Ok(r) = gh.get_json::<Release>(&by_tag).await {
-        return Ok(r);
-    }
-    #[derive(Serialize)]
-    struct NewRelease<'a> {
-        tag_name: &'a str,
-        name: &'a str,
-        body: &'a str,
-        draft: bool,
-        prerelease: bool,
-    }
-    let new = NewRelease {
-        tag_name: tag,
-        name: &format!("Zohara {channel} channel"),
-        body: &format!("Auto-managed by zohara-updates-system. OTA channel: {channel}."),
-        draft: false,
-        prerelease: channel != "stable",
-    };
-    let url = format!("https://api.github.com/repos/{owner}/{name}/releases");
-    let r: Release = gh
-        .put_json(&url, &new)
-        .await
-        .context("create release")?;
-    Ok(r)
-}
-
-async fn update_apps_json(
-    gh: &Gh,
-    owner: &str,
-    name: &str,
-    pkg_filename: &str,
-) -> Result<()> {
-    let pkg = pkg_filename.trim_end_matches(".pkg.tar.zst");
-    let url = format!("https://api.github.com/repos/{owner}/{name}/contents/apps.json");
-    let existing: Option<ContentEntry> = gh.get_json(&url).await.ok();
-    let mut apps: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    if let Some(e) = &existing {
-        if let Some(dl) = &e.download_url {
-            if let Ok(bytes) = gh.get_bytes(dl).await {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if let Some(obj) = v.as_object() {
-                        for (k, v) in obj {
-                            apps.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    apps.insert(
-        pkg.to_string(),
-        serde_json::json!({
-            "last_published": chrono::Utc::now().to_rfc3339(),
-            "source": "zohara-updates-system",
-            "filename": pkg_filename,
-        }),
-    );
-    let body = serde_json::to_string_pretty(&apps)?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
-
-    #[derive(Serialize)]
-    struct PutFile<'a> {
-        message: &'a str,
-        content: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        sha: Option<&'a str>,
-    }
-    let put = PutFile {
-        message: &format!("chore(publish): record {pkg} via zohara-updates-system"),
-        content: &b64,
-        sha: existing.as_ref().map(|e| e.sha.as_str()),
-    };
-    let _: serde_json::Value = gh.put_json(&url, &put).await?;
-    Ok(())
-}
-
 // ── Health ───────────────────────────────────────────────────
 
 async fn health() -> &'static str {
@@ -1192,5 +843,17 @@ mod tests {
     #[test]
     fn urlencode_escapes() {
         assert_eq!(urlencode("a b&c"), "a%20b%26c");
+    }
+
+    #[test]
+    fn dispatch_body_shape() {
+        let b = dispatch_body("Zohaib8090/zohara-apps", 35880065846, "alpha", Some("zohara-apps-x86_64"));
+        assert_eq!(b["event_type"], "package-published");
+        assert_eq!(b["client_payload"]["run_id"], "35880065846");
+        assert_eq!(b["client_payload"]["source_repo"], "Zohaib8090/zohara-apps");
+        assert_eq!(b["client_payload"]["channel"], "alpha");
+        assert_eq!(b["client_payload"]["artifact_name"], "zohara-apps-x86_64");
+        let b = dispatch_body("Zohaib8090/zohara-settings", 1, "stable", None);
+        assert!(b["client_payload"].get("artifact_name").is_none());
     }
 }

@@ -18,6 +18,7 @@
     button { background:#238636; color:#fff; border:0; border-radius:6px; padding:0.4rem 0.8rem; cursor:pointer; font-size:0.9rem; }
     button.beta { background:#1f6feb; }
     button.alpha { background:#d29922; }
+    .ok { background:#12261a; border:1px solid #238636; padding:1rem; border-radius:6px; }
     .err { background:#3d1d1d; border:1px solid #f85149; padding:1rem; border-radius:6px; }
   </style>
 </head>
@@ -30,8 +31,11 @@
       <a href="{{ repo.html_url }}">github</a></div>
   </div>
 
+  {% if let Some(n) = notice %}
+  <p class="ok">{{ n }} <a href="{{ actions_url }}">Open the Actions page</a></p>
+  {% endif %}
   {% if !publish_enabled %}
-  <p class="err">Publishing is switched off until phase 2 of docs/PLAN.md is done. You can look, but the buttons will refuse.</p>
+  <p class="err">Publishing is switched off on the server. You can look, but the buttons will refuse.</p>
   {% endif %}
   <h2>Recent successful runs</h2>
   {% if runs.is_empty() %}
@@ -50,7 +54,7 @@
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <input type="hidden" name="repo" value="{{ repo.full }}">
       <input type="hidden" name="run_id" value="{{ r.id }}">
-      <button type="submit" name="channel" value="stable">Publish to stable</button>
+      <button type="submit" name="channel" value="stable" onclick="return confirm('Publish to STABLE? Every Zohara computer will get this.')">Publish to stable</button>
     </form>
     <form method="post" action="/publish">
       <input type="hidden" name="csrf" value="{{ csrf }}">

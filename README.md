@@ -5,20 +5,18 @@ Tiny Rust web dashboard that watches our package-building repos
 re-publish their artifacts to the OTA channel releases in
 `Zohaib8090/zohara-packages` with one click.
 
-Replaces the broken cross-repo GitHub Actions dispatch loop we kept
-fighting. The dashboard calls the GitHub REST API directly:
-downloads the `.pkg.tar.zst` artifact from the latest successful
-build, runs `repo-add`, uploads the new `zohara.db` to the channel
-release, and commits `apps.json` back.
+Since phase 2 (2026-10-02) the dashboard no longer publishes anything itself. Pressing a Publish button checks
+the request (watched repository, successful `main` build, artifact still there) and starts the `publish.yml`
+workflow in `Zohaib8090/zohara-packages` with a `repository_dispatch`; that workflow does the download,
+`repo-add`, upload and `apps.json` update (see that repo's README). You can follow it on the Actions page. The
+old in-service publisher wiped the database each time and is gone.
 
 No database, no persistent state — every page is a fresh GET.
 
 ## Sign-in (since 2026-10-01)
 
 Every page except `/health`, `/login` and `/auth/callback` needs a GitHub sign-in, and only one numeric GitHub user
-id gets in. **Publishing is switched off** (`ZOHARA_HUB_PUBLISH_ENABLED` unset) until phase 2 of
-[docs/PLAN.md](docs/PLAN.md): the old publish code replaces the whole package database. Read the plan before
-turning it on.
+id gets in. Publishing only works when `ZOHARA_HUB_PUBLISH_ENABLED=1`. See [docs/PLAN.md](docs/PLAN.md).
 
 | Env var | What |
 |---|---|
@@ -27,7 +25,7 @@ turning it on.
 | `ZOHARA_HUB_ALLOWED_USER_ID` | numeric id of the only account allowed in (`gh api users/Zohaib8090 --jq .id`) |
 | `ZOHARA_HUB_SESSION_SECRET` | 32+ random characters that sign the session cookie |
 | `ZOHARA_HUB_BASE_URL` | the public address, no trailing slash (for the OAuth callback) |
-| `ZOHARA_HUB_PUBLISH_ENABLED` | `1` to allow `/publish` (leave unset for now) |
+| `ZOHARA_HUB_PUBLISH_ENABLED` | `1` to allow `/publish` (it starts the publish workflow; unset = look only) |
 | `ZOHARA_HUB_SELF_PING` | `0` to turn off the keep-awake ping (on by default; see below) |
 
 In the GitHub App's settings add the **Callback URL** `<ZOHARA_HUB_BASE_URL>/auth/callback` and generate a client
