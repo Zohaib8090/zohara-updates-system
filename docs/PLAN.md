@@ -151,3 +151,11 @@ Phases 0 to 2 fix what is broken today. Phases 3 to 7 are the new features.
 | `Gh` REST helper, `urlencode` | `ensure_release` (PUT bug), `update_apps_json` |
 | askama templates and layout, `/health` | open routes (wrap them in the login middleware) |
 | Dockerfile structure (Rust build, small runtime) | runtime image no longer needs `pacman`/`repo-add` once the workflow does the db work |
+
+## Open cleanup (as of 2026-10-02; the owner chose to do these later)
+
+1. **Rotate the GitHub App client secret.** Its value was shown in a chat on 2026-10-01 (a file was named after it). Generate a new
+   one on the App page, put it in Render's `ZOHARA_HUB_CLIENT_SECRET`, then delete the old one.
+2. **Delete three local files that hold secrets:** `~/zohara-hub.env`, `~/Documents/zohara-updates-system.2026-10-01.private-key.pem`,
+   `~/Documents/ab809e5800174bae45e2d53d62e9815c2abf6343.txt`. (The new App private key itself is not exposed; the old two were deleted on GitHub.)
+3. **Click-test Publish on the live site** with alpha (needs a signed-in browser), then delete the `channel-alpha` release again.
