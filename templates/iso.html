@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}ISO · Zohara releases{% endblock %}
+{% block content %}
+<h1>Zohara OS ISO</h1>
+<p class="lead">Promoting copies a finished ISO build to the public download bucket and checks the copy byte for byte.</p>
+
+{% if let Some(n) = notice %}
+<div class="banner ok">{{ n }} <a href="{{ actions_url }}">Open the Actions page</a></div>
+{% endif %}
+{% if let Some(e) = err %}<div class="banner err">{{ e }}</div>{% endif %}
+{% if !publish_enabled %}
+<div class="banner err">Publishing is switched off on the server. You can look, but the buttons will refuse.</div>
+{% endif %}
+
+<h2 style="margin-top:1rem">Published now</h2>
+<div class="panel">
+{% if let Some(l) = live_iso %}
+  <div><span class="tag green">live</span> <strong>{{ l.file }}</strong></div>
+  <dl class="kv">
+    <dt>Size</dt><dd>{{ l.size_gb }}</dd>
+    <dt>SHA-256</dt><dd class="mono small">{{ l.sha256 }}</dd>
+    <dt>Download</dt><dd><a href="{{ l.url }}">{{ l.url }}</a></dd>
+  </dl>
+  <p class="muted small" style="margin-bottom:0">The website's button and checksum are still changed by hand when you switch to a new ISO.</p>
+{% else %}
+  <span class="muted">Nothing has been promoted through this page yet. (The first ISO on the bucket was uploaded by hand.)</span>
+{% endif %}
+</div>
+
+<h2>Finished ISO builds</h2>
+{% if builds.is_empty() %}
+<div class="card empty">No finished ISO builds with a downloadable file were found.</div>
+{% endif %}
+<div class="rows">
+{% for b in builds %}
+  <div class="card row">
+    <div class="row-main">
+      <div class="row-title"><a href="{{ b.html_url }}">{{ b.title }}</a></div>
+      <div class="row-meta">
+        <span class="mono">{{ b.sha7 }}</span> ·
+        <time datetime="{{ b.created_at }}">{{ b.created_at }}</time> · {{ b.size_gb }} ·
+        file kept on GitHub until {{ b.expires }}
+      </div>
+    </div>
+    <form class="inline" method="post" action="/publish-iso">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="run_id" value="{{ b.id }}">
+      <div class="actions">
+        <button type="submit" {% if !publish_enabled %}disabled{% endif %}
+          onclick="return confirm('Promote this ISO to the public download bucket?\n\nIf an ISO with the same date in its name is already there, it is replaced.')">Promote ISO</button>
+      </div>
+    </form>
+  </div>
+{% endfor %}
+</div>
+{% endblock %}

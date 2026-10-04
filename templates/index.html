@@ -1,38 +1,27 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>{{ title }}</title>
-  <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-           background:#0d1117; color:#c9d1d9; margin:0; padding:2rem; }
-    a { color:#58a6ff; text-decoration:none; }
-    a:hover { text-decoration:underline; }
-    h1 { font-weight:500; }
-    .grid { display:grid; gap:1rem; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); }
-    .card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1rem; }
-    .name { font-size:1.1rem; font-weight:600; }
-    .desc { color:#8b949e; font-size:0.9rem; margin:0.4rem 0; }
-    .meta { color:#8b949e; font-size:0.85rem; }
-    button { background:#30363d; color:#c9d1d9; border:0; border-radius:6px; padding:0.4rem 0.8rem; cursor:pointer; }
-    .err { background:#3d1d1d; border:1px solid #f85149; padding:1rem; border-radius:6px; }
-  </style>
-</head>
-<body>
-  <form method="post" action="/logout" style="float:right"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">Sign out</button></form>
-  <h1>{{ title }}</h1>
-  <p>Watched package repos. Click to view recent builds and publish.</p>
-  {% if let Some(e) = err %}
-  <div class="err">{{ e }}</div>
-  {% endif %}
-  <div class="grid">
-    {% for r in repos %}
-    <a class="card" href="/repo/{{ r.owner }}/{{ r.name }}">
-      <div class="name">{{ r.full }}</div>
-      <div class="desc">{{ r.description }}</div>
-      <div class="meta">★ {{ r.stars }} · issues {{ r.issues }}</div>
-    </a>
-    {% endfor %}
-  </div>
-</body>
-</html>
+{% extends "base.html" %}
+{% block title %}Zohara releases{% endblock %}
+{% block content %}
+<h1>Release control</h1>
+<p class="lead">Pick a build, pick where it goes. GitHub Actions does the publishing; this page only starts it.</p>
+{% if let Some(e) = err %}<div class="banner err">{{ e }}</div>{% endif %}
+
+<h2 style="margin-top:1rem">Packages</h2>
+<div class="grid">
+  {% for r in repos %}
+  <a class="card" href="/repo/{{ r.owner }}/{{ r.name }}">
+    <div class="name">{{ r.name }}</div>
+    <div class="desc">{{ r.description }}</div>
+    <span class="tag">alpha</span> <span class="tag blue">beta</span> <span class="tag green">stable</span>
+  </a>
+  {% endfor %}
+</div>
+
+<h2>Operating system image</h2>
+<div class="grid">
+  <a class="card" href="/iso">
+    <div class="name">Zohara OS ISO</div>
+    <div class="desc">Copy a finished ISO build to the public download bucket.</div>
+    {% if let Some(l) = live_iso %}<span class="tag green">live: {{ l.version }}</span>{% else %}<span class="tag">nothing promoted yet</span>{% endif %}
+  </a>
+</div>
+{% endblock %}

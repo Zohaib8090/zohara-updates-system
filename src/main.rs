@@ -47,6 +47,7 @@ struct AppConfig {
     private_key_pem: String,
     watched_repos: Vec<(String, String)>, // (owner, name)
     pkg_repo: (String, String),           // (owner, name)
+    iso_repo: (String, String),           // the repo whose CI builds the ISO (owner, name)
     // Login (see auth.rs)
     client_id: String,
     client_secret: String,
@@ -77,6 +78,7 @@ impl AppConfig {
             env::var("ZOHARA_HUB_PKG_REPO")
                 .unwrap_or_else(|_| "zohara-packages".into()),
         );
+        let iso_repo = (owner.clone(), "zohara".to_string());
         let session_secret = require_env("ZOHARA_HUB_SESSION_SECRET")?.into_bytes();
         if session_secret.len() < 32 {
             bail!("ZOHARA_HUB_SESSION_SECRET must be at least 32 characters");
@@ -87,6 +89,7 @@ impl AppConfig {
             private_key_pem,
             watched_repos: watched,
             pkg_repo,
+            iso_repo,
             client_id: require_env("ZOHARA_HUB_CLIENT_ID")?,
             client_secret: require_env("ZOHARA_HUB_CLIENT_SECRET")?,
             session_secret,
@@ -316,6 +319,8 @@ struct Artifact {
     size_in_bytes: u64,
     archive_download_url: String,
     expired: bool,
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -331,8 +336,9 @@ struct RepoInfo {
 #[derive(Template)]
 #[template(path = "index.html")]
 struct IndexTpl<'a> {
-    title: &'a str,
+    active: &'a str,
     repos: &'a [RepoSummary],
+    live_iso: Option<LiveIso>,
     err: Option<&'a str>,
     csrf: &'a str,
 }
@@ -340,7 +346,7 @@ struct IndexTpl<'a> {
 #[derive(Template)]
 #[template(path = "repo.html")]
 struct RepoTpl<'a> {
-    title: &'a str,
+    active: &'a str,
     repo: &'a RepoSummary,
     runs: &'a [WorkflowRun],
     csrf: &'a str,
@@ -352,8 +358,45 @@ struct RepoTpl<'a> {
 #[derive(Template)]
 #[template(path = "error.html")]
 struct ErrorTpl<'a> {
-    title: &'a str,
+    active: &'a str,
+    csrf: &'a str,
     err: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "iso.html")]
+struct IsoTpl<'a> {
+    active: &'a str,
+    csrf: &'a str,
+    builds: &'a [IsoBuild],
+    live_iso: Option<LiveIso>,
+    publish_enabled: bool,
+    notice: Option<&'a str>,
+    err: Option<&'a str>,
+    actions_url: &'a str,
+}
+
+/// One finished ISO build that can be promoted.
+struct IsoBuild {
+    id: u64,
+    title: String,
+    sha7: String,
+    created_at: String,
+    html_url: String,
+    size_gb: String,
+    expires: String,
+}
+
+/// What `latest.json` in the public bucket says is published now (written by the Promote ISO workflow).
+#[derive(Deserialize, Clone, Debug)]
+struct LiveIso {
+    version: String,
+    file: String,
+    sha256: String,
+    size: u64,
+    url: String,
+    #[serde(skip)]
+    size_gb: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -404,7 +447,8 @@ struct CallbackQuery {
 
 fn err_page(msg: &str) -> Response {
     let html = ErrorTpl {
-        title: "zohara-updates-system",
+        active: "",
+        csrf: "",
         err: msg,
     }
     .render()
@@ -439,8 +483,9 @@ async fn index(State(s): State<AppState>, Extension(sess): Extension<auth::Sessi
         }
     }
     render_html(IndexTpl {
-        title: "zohara-updates-system",
+        active: "packages",
         repos: &summaries,
+        live_iso: fetch_live_iso(&s).await,
         err: None,
         csrf: &sess.csrf,
     })
@@ -480,7 +525,7 @@ async fn repo_view(
         html_url: format!("https://github.com/{full}"),
     };
     render_html(RepoTpl {
-        title: "zohara-updates-system",
+        active: "packages",
         repo: &summary,
         runs: &runs.workflow_runs,
         csrf: &sess.csrf,
@@ -495,6 +540,149 @@ async fn repo_view(
             s.cfg.pkg_repo.0, s.cfg.pkg_repo.1
         ),
     })
+}
+
+// ── ISO promotion ───────────────────────────────────────────────────────
+
+/// Name of the CI workflow in the ISO repo, and of the artifact that holds the ISO. `promote-iso.yml` in
+/// zohara-packages checks the same things again before it copies anything.
+const ISO_WORKFLOW_NAME: &str = "Build Zohara OS ISO";
+const ISO_ARTIFACT: &str = "zohara-os-x86_64";
+/// Public bucket the ISO is promoted to (the workflow writes `latest.json` there last).
+const ISO_PUBLIC_BASE: &str = "https://objectstorage.ap-mumbai-1.oraclecloud.com/n/bm27e3oxmp04/b/zohara-os/o/";
+
+/// A finished, successful ISO build from the ISO repo's `master`, started by a push or by hand.
+fn iso_run_is_publishable(run: &WorkflowRun, repo_full: &str) -> Result<(), String> {
+    if run.status != "completed" || run.conclusion.as_deref() != Some("success") {
+        return Err("that run did not finish successfully".into());
+    }
+    if run.name != ISO_WORKFLOW_NAME {
+        return Err(format!("that run is `{}`, not `{ISO_WORKFLOW_NAME}`", run.name));
+    }
+    if run.head_branch != "master" {
+        return Err(format!("that run is from branch `{}`, only `master` can be promoted", run.head_branch));
+    }
+    if !["push", "workflow_dispatch", "repository_dispatch"].contains(&run.event.as_str()) {
+        return Err(format!("that run was started by `{}`, which is not accepted", run.event));
+    }
+    match &run.head_repository {
+        Some(r) if r.full_name.eq_ignore_ascii_case(repo_full) => Ok(()),
+        _ => Err("that run does not come from the ISO repository itself".into()),
+    }
+}
+
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+}
+
+/// The `repository_dispatch` body that starts zohara-packages' Promote ISO workflow.
+fn iso_dispatch_body(run_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "event_type": "iso-promote",
+        "client_payload": { "run_id": run_id.to_string(), "requested_via": "zohara-updates-system" },
+    })
+}
+
+/// Reads `latest.json` from the public bucket. `None` when there is none yet or it cannot be read; this never
+/// stops a page from showing.
+async fn fetch_live_iso(s: &AppState) -> Option<LiveIso> {
+    let resp = s.gh.client.get(format!("{ISO_PUBLIC_BASE}latest.json")).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let mut l: LiveIso = resp.json().await.ok()?;
+    l.size_gb = gigabytes(l.size);
+    Some(l)
+}
+
+async fn iso_view(
+    State(s): State<AppState>,
+    Extension(sess): Extension<auth::Session>,
+    Query(q): Query<RepoQuery>,
+) -> Response {
+    let (owner, name) = s.cfg.iso_repo.clone();
+    let full = format!("{owner}/{name}");
+    let runs_url = format!("https://api.github.com/repos/{full}/actions/runs?branch=master&status=success&per_page=30");
+    let runs: WorkflowRuns = match s.gh.get_json(&runs_url).await {
+        Ok(r) => r,
+        Err(e) => return err_page(&format!("failed to list ISO builds of {full}: {e:#}")),
+    };
+    let mut builds = Vec::new();
+    for run in runs.workflow_runs.iter().filter(|r| iso_run_is_publishable(r, &full).is_ok()).take(6) {
+        let arts_url = format!("https://api.github.com/repos/{full}/actions/runs/{}/artifacts", run.id);
+        let Ok(arts) = s.gh.get_json::<Artifacts>(&arts_url).await else { continue };
+        // Builds whose file GitHub already deleted cannot be promoted, so they are not listed.
+        let Some(a) = arts.artifacts.iter().find(|a| a.name == ISO_ARTIFACT && !a.expired) else { continue };
+        builds.push(IsoBuild {
+            id: run.id,
+            title: run.display_title.clone(),
+            sha7: run.head_sha.chars().take(7).collect(),
+            created_at: run.created_at.clone(),
+            html_url: run.html_url.clone(),
+            size_gb: gigabytes(a.size_in_bytes),
+            expires: a.expires_at.clone().unwrap_or_default().chars().take(10).collect(),
+        });
+    }
+    render_html(IsoTpl {
+        active: "iso",
+        csrf: &sess.csrf,
+        builds: &builds,
+        live_iso: fetch_live_iso(&s).await,
+        publish_enabled: s.cfg.publish_enabled,
+        notice: match q.notice.as_deref() {
+            Some("started") => Some("Promote started. Copying a 4 GB file takes 10 to 20 minutes; follow it on the Actions page."),
+            _ => None,
+        },
+        err: None,
+        actions_url: &format!(
+            "https://github.com/{}/{}/actions/workflows/promote-iso.yml",
+            s.cfg.pkg_repo.0, s.cfg.pkg_repo.1
+        ),
+    })
+}
+
+#[derive(Deserialize)]
+struct PromoteIsoForm {
+    run_id: u64,
+    csrf: String,
+}
+
+async fn publish_iso(
+    State(s): State<AppState>,
+    Extension(sess): Extension<auth::Session>,
+    Form(f): Form<PromoteIsoForm>,
+) -> Response {
+    if !auth::same(&f.csrf, &sess.csrf) {
+        return (StatusCode::FORBIDDEN, "bad or missing CSRF token\n").into_response();
+    }
+    if !s.cfg.publish_enabled {
+        return err_page("Publishing is switched off (ZOHARA_HUB_PUBLISH_ENABLED is not 1).");
+    }
+    let (owner, name) = s.cfg.iso_repo.clone();
+    let full = format!("{owner}/{name}");
+    let run: WorkflowRun = match s.gh.get_json(&format!("https://api.github.com/repos/{full}/actions/runs/{}", f.run_id)).await {
+        Ok(r) => r,
+        Err(e) => return err_page(&format!("look up run {}: {e:#}", f.run_id)),
+    };
+    if let Err(why) = iso_run_is_publishable(&run, &full) {
+        return err_page(&why);
+    }
+    let arts: Artifacts = match s.gh.get_json(&format!("https://api.github.com/repos/{full}/actions/runs/{}/artifacts", f.run_id)).await {
+        Ok(a) => a,
+        Err(e) => return err_page(&format!("list artifacts of run {}: {e:#}", f.run_id)),
+    };
+    if !arts.artifacts.iter().any(|a| a.name == ISO_ARTIFACT && !a.expired) {
+        return err_page("this build's ISO file is gone from GitHub (it keeps them 30 days)");
+    }
+    let url = format!("https://api.github.com/repos/{}/{}/dispatches", s.cfg.pkg_repo.0, s.cfg.pkg_repo.1);
+    match s.gh.post_json(&url, &iso_dispatch_body(f.run_id)).await {
+        Ok((st, _)) if st == StatusCode::NO_CONTENT => {
+            log::info!("iso promote started: run {}", f.run_id);
+            Redirect::to("/iso?notice=started").into_response()
+        }
+        Ok((st, text)) => err_page(&format!("GitHub refused to start the promote: HTTP {st} {text}")),
+        Err(e) => err_page(&format!("could not reach GitHub: {e:#}")),
+    }
 }
 
 fn is_watched(cfg: &AppConfig, owner: &str, name: &str) -> bool {
@@ -775,6 +963,8 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         .route("/repo/:owner/:name", get(repo_view))
         .route("/publish", post(publish))
+        .route("/iso", get(iso_view))
+        .route("/publish-iso", post(publish_iso))
         .route("/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_login));
     let open = Router::new()
@@ -818,6 +1008,49 @@ mod tests {
     }
 
     const REPO: &str = "Zohaib8090/zohara-settings";
+    const ISO_REPO: &str = "Zohaib8090/zohara";
+
+    fn iso_run(branch: &str, event: &str, conclusion: Option<&str>, name: &str, repo: Option<&str>) -> WorkflowRun {
+        let mut r = run(branch, event, "completed", conclusion, repo);
+        r.name = name.into();
+        r
+    }
+
+    #[test]
+    fn good_iso_run_is_promotable() {
+        for ev in ["push", "workflow_dispatch", "repository_dispatch"] {
+            assert!(iso_run_is_publishable(&iso_run("master", ev, Some("success"), ISO_WORKFLOW_NAME, Some(ISO_REPO)), ISO_REPO).is_ok());
+        }
+    }
+
+    #[test]
+    fn bad_iso_runs_are_refused() {
+        let ok = |b, e, c, n, r| iso_run_is_publishable(&iso_run(b, e, c, n, r), ISO_REPO).is_ok();
+        assert!(!ok("master", "push", Some("failure"), ISO_WORKFLOW_NAME, Some(ISO_REPO)));
+        assert!(!ok("main", "push", Some("success"), ISO_WORKFLOW_NAME, Some(ISO_REPO)));
+        assert!(!ok("master", "pull_request", Some("success"), ISO_WORKFLOW_NAME, Some(ISO_REPO)));
+        assert!(!ok("master", "push", Some("success"), "Some other workflow", Some(ISO_REPO)));
+        assert!(!ok("master", "push", Some("success"), ISO_WORKFLOW_NAME, Some("Evil/zohara")));
+        assert!(!ok("master", "push", Some("success"), ISO_WORKFLOW_NAME, None));
+    }
+
+    #[test]
+    fn iso_dispatch_body_shape() {
+        let b = iso_dispatch_body(42);
+        assert_eq!(b["event_type"], "iso-promote");
+        assert_eq!(b["client_payload"]["run_id"], "42");
+    }
+
+    #[test]
+    fn gigabytes_formats() {
+        assert_eq!(gigabytes(3_920_658_608), "3.9 GB");
+    }
+
+    #[test]
+    fn latest_json_parses() {
+        let l: LiveIso = serde_json::from_str(r#"{"version":"2026.10.05","file":"a.iso","sha256":"ab","size":5,"url":"https://x/a.iso"}"#).unwrap();
+        assert_eq!(l.file, "a.iso");
+    }
 
     #[test]
     fn good_run_is_publishable() {
@@ -855,5 +1088,28 @@ mod tests {
         assert_eq!(b["client_payload"]["artifact_name"], "zohara-apps-x86_64");
         let b = dispatch_body("Zohaib8090/zohara-settings", 1, "stable", None);
         assert!(b["client_payload"].get("artifact_name").is_none());
+    }
+
+    /// Renders every page with sample data. Set ZHUB_RENDER_DIR to also write the HTML files and look at them.
+    #[test]
+    fn pages_render() {
+        let repo = RepoSummary {
+            owner: "Zohaib8090".into(), name: "zohara-settings".into(), full: "Zohaib8090/zohara-settings".into(),
+            description: "Settings app".into(), stars: 0, issues: 0, html_url: "https://github.com/Zohaib8090/zohara-settings".into(),
+        };
+        let live = LiveIso { version: "2026.09.30".into(), file: "zohara-os-2026.09.30-x86_64.iso".into(), sha256: "ab12".into(), size: 3_900_000_000, url: "https://x/a.iso".into(), size_gb: "3.9 GB".into() };
+        let r = run("main", "push", "completed", Some("success"), Some(REPO));
+        let build = IsoBuild { id: 7, title: "Dockerfile: cache brave".into(), sha7: "abcdef0".into(), created_at: "2026-09-30T08:58:26Z".into(), html_url: "https://x".into(), size_gb: "3.9 GB".into(), expires: "2026-10-30".into() };
+        let pages = [
+            ("index", IndexTpl { active: "packages", repos: &[repo.clone()], live_iso: Some(live.clone()), err: None, csrf: "tok" }.render().unwrap()),
+            ("repo", RepoTpl { active: "packages", repo: &repo, runs: &[r], csrf: "tok", publish_enabled: true, notice: Some("Publish started."), actions_url: "https://x" }.render().unwrap()),
+            ("iso", IsoTpl { active: "iso", csrf: "tok", builds: &[build], live_iso: Some(live), publish_enabled: true, notice: None, err: None, actions_url: "https://x" }.render().unwrap()),
+            ("error", ErrorTpl { active: "", csrf: "", err: "boom" }.render().unwrap()),
+        ];
+        assert!(pages[2].1.contains("/publish-iso") && pages[2].1.contains("Promote ISO"));
+        assert!(!pages[3].1.contains("Sign out"));
+        if let Ok(dir) = std::env::var("ZHUB_RENDER_DIR") {
+            for (n, h) in &pages { std::fs::write(format!("{dir}/{n}.html"), h).unwrap(); }
+        }
     }
 }

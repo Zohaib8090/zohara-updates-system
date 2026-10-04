@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>{% block title %}Zohara releases{% endblock %}</title>
+  <style>
+    :root {
+      --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#30363d; --text:#e6edf3; --muted:#8b949e;
+      --link:#58a6ff; --green:#238636; --green-bg:#12261a; --blue:#1f6feb; --amber:#d29922; --red:#f85149; --red-bg:#3d1d1d;
+      --shadow:0 1px 0 rgba(0,0,0,.2), 0 8px 24px rgba(0,0,0,.18);
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg:#f6f8fa; --panel:#ffffff; --panel2:#f0f3f6; --line:#d0d7de; --text:#1f2328; --muted:#59636e;
+        --link:#0969da; --green:#1a7f37; --green-bg:#dafbe1; --blue:#0969da; --amber:#9a6700; --red:#cf222e; --red-bg:#ffebe9;
+        --shadow:0 1px 0 rgba(31,35,40,.04), 0 6px 18px rgba(31,35,40,.08);
+      }
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); line-height:1.5;
+           font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+    a { color:var(--link); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    .topbar { background:var(--panel); border-bottom:1px solid var(--line); }
+    .topbar-in { max-width:960px; margin:0 auto; padding:.75rem 16px; display:flex; align-items:center; gap:1rem; flex-wrap:wrap; }
+    .brand { font-weight:700; letter-spacing:.2px; color:var(--text); }
+    .brand:hover { text-decoration:none; }
+    .nav { display:flex; gap:.25rem; flex:1; }
+    .nav a { color:var(--muted); padding:.35rem .75rem; border-radius:6px; font-size:.95rem; }
+    .nav a:hover { background:var(--panel2); text-decoration:none; color:var(--text); }
+    .nav a.on { color:var(--text); background:var(--panel2); font-weight:600; }
+    main { max-width:960px; margin:0 auto; padding:24px 16px 64px; }
+    h1 { font-size:1.6rem; font-weight:650; margin:.2rem 0 .4rem; }
+    h2 { font-size:1.15rem; font-weight:600; margin:2rem 0 .75rem; }
+    .lead { color:var(--muted); margin:0 0 1.25rem; }
+    .muted { color:var(--muted); }
+    .small { font-size:.85rem; }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    .card, .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; box-shadow:var(--shadow); }
+    .panel { padding:1rem 1.25rem; }
+    .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(270px,1fr)); }
+    a.card { display:block; padding:1rem 1.25rem; color:var(--text); transition:border-color .15s, transform .15s; }
+    a.card:hover { border-color:var(--link); text-decoration:none; transform:translateY(-1px); }
+    .card .name { font-weight:650; font-size:1.05rem; }
+    .card .desc { color:var(--muted); font-size:.9rem; margin:.35rem 0 .6rem; min-height:2.6em; }
+    .tag { display:inline-block; font-size:.75rem; font-weight:600; padding:.1rem .55rem; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
+    .tag.green { color:var(--green); border-color:var(--green); }
+    .tag.amber { color:var(--amber); border-color:var(--amber); }
+    .tag.blue { color:var(--blue); border-color:var(--blue); }
+    .rows { display:flex; flex-direction:column; gap:10px; }
+    .row { padding:.9rem 1.1rem; display:flex; gap:1rem; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+    .row-main { min-width:0; flex:1 1 320px; }
+    .row-title { font-weight:600; overflow-wrap:anywhere; }
+    .row-meta { color:var(--muted); font-size:.85rem; margin-top:.2rem; overflow-wrap:anywhere; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; }
+    form.inline { display:contents; }
+    button, .btn { font:inherit; font-size:.9rem; font-weight:600; color:#fff; background:var(--green); border:0; border-radius:7px;
+                   padding:.5rem .9rem; cursor:pointer; min-height:38px; }
+    button:hover, .btn:hover { filter:brightness(1.1); text-decoration:none; }
+    button:focus-visible, a:focus-visible { outline:2px solid var(--link); outline-offset:2px; }
+    button.beta { background:var(--blue); }
+    button.alpha { background:var(--amber); color:#fff; }
+    button.ghost { background:transparent; color:var(--muted); border:1px solid var(--line); font-weight:500; }
+    button.ghost:hover { color:var(--text); filter:none; background:var(--panel2); }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .banner { border-radius:8px; padding:.8rem 1rem; margin:0 0 1rem; border:1px solid; }
+    .banner.ok { background:var(--green-bg); border-color:var(--green); }
+    .banner.err { background:var(--red-bg); border-color:var(--red); }
+    .kv { display:grid; grid-template-columns:max-content 1fr; gap:.3rem 1rem; margin:.5rem 0 0; font-size:.92rem; }
+    .kv dt { color:var(--muted); } .kv dd { margin:0; overflow-wrap:anywhere; }
+    .crumbs { margin:0 0 .5rem; font-size:.9rem; }
+    .empty { color:var(--muted); padding:1.5rem; text-align:center; }
+    .errbox { white-space:pre-wrap; font-family:ui-monospace,monospace; }
+    @media (max-width:560px) { .actions { width:100%; } .actions button { flex:1; } }
+  </style>
+</head>
+<body>
+  <header class="topbar"><div class="topbar-in">
+    <a class="brand" href="/">Zohara releases</a>
+    <nav class="nav">
+      <a href="/" {% if active == "packages" %}class="on"{% endif %}>Packages</a>
+      <a href="/iso" {% if active == "iso" %}class="on"{% endif %}>ISO</a>
+    </nav>
+    {% if !csrf.is_empty() %}
+    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost" type="submit">Sign out</button></form>
+    {% endif %}
+  </div></header>
+  <main>
+  {% block content %}{% endblock %}
+  </main>
+  <script>
+    // Show times as "3 days ago"; the exact time stays in the tooltip. Without JavaScript the raw time is shown.
+    document.querySelectorAll('time[datetime]').forEach(function (t) {
+      var d = new Date(t.getAttribute('datetime')); if (isNaN(d)) return;
+      var s = (Date.now() - d.getTime()) / 1000, f = s < 0 ? -1 : 1; s = Math.abs(s);
+      var u = [[60,'second'],[60,'minute'],[24,'hour'],[30,'day'],[12,'month'],[1e9,'year']], n = s, i = 0;
+      for (; i < u.length - 1 && n >= u[i][0]; i++) n /= u[i][0];
+      n = Math.floor(n); var w = u[i][1] + (n === 1 ? '' : 's');
+      t.title = d.toLocaleString(); t.textContent = f > 0 ? n + ' ' + w + ' ago' : 'in ' + n + ' ' + w;
+    });
+  </script>
+</body>
+</html>

@@ -11,6 +11,13 @@ workflow in `Zohaib8090/zohara-packages` with a `repository_dispatch`; that work
 `repo-add`, upload and `apps.json` update (see that repo's README). You can follow it on the Actions page. The
 old in-service publisher wiped the database each time and is gone.
 
+The **ISO** page (`/iso`, added 2026-10-04) lists finished "Build Zohara OS ISO" runs of `Zohaib8090/zohara` (`master`,
+artifact `zohara-os-x86_64` still on GitHub) and shows what `latest.json` in the public `zohara-os` bucket says is live.
+Its Promote button (`POST /publish-iso`) dispatches `iso-promote` to `zohara-packages`, whose `promote-iso.yml` copies
+the ISO to OCI and checks it. Same rules as packages: sign-in, CSRF, publish switch. Pages share one layout
+(`templates/base.html`, dark and light, phone width); `cargo test pages_render` renders them (set `ZHUB_RENDER_DIR`
+to write the HTML files and look at them).
+
 No database, no persistent state — every page is a fresh GET.
 
 ## Sign-in (since 2026-10-01)
