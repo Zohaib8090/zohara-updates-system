@@ -113,7 +113,7 @@ entry.
 | 0 | **You:** suspend the Render service now (it is open to the internet). | `https://zohara-updates-system.onrender.com/` no longer serves the buttons. |
 | 1 | **Make it safe.** (**Coded and tested locally 2026-10-01, not deployed**: `src/auth.rs`, login middleware, CSRF, watched-repo allowlist, run checks, publishing off.) New GitHub App key; allowlisted repos only; run must be successful, on `main`, event `push`; login + CSRF middleware; restrict the app to the repos it needs. | Without a session, `POST /publish` and every page redirect or return 401; a forged `repo` is refused; test in code. |
 | 2 | **Make it correct.** (**Done 2026-10-02**: `publish.yml` takes a run id, checks inputs and run, merges and re-checks the database, apps.json only on stable; the site starts it with a dispatch. Tested on alpha with real runs of both source repos; a real `pacman -Sl zohara-alpha` listed 6 packages. The site's Publish button was not clicked live yet.) Fix `publish.yml` to take a `run_id`; promote workflow merges into the existing db and writes `zohara-<channel>.db/.files`; site triggers it. Try on `alpha` only. | In the test VM, `pacman -Sy` against the alpha channel lists at least two packages after publishing both. |
-| 3 | **Storage.** OCI as main, GitHub as mirror, for packages; ISO promote with `SHA256SUMS`. | Download from the public OCI URL and compare the hash to the build's. |
+| 3 | **Storage.** (**Code done and tested offline 2026-10-04, not live**: `zohara-packages` `scripts/oci-upload.sh` + mirror step in `publish.yml`, `promote-iso.yml`. Still needed: the OCI bucket `zohara-packages`, two OCI write URLs saved as GitHub secrets `OCI_PACKAGES_PAR` / `OCI_ISO_PAR`, then a real alpha publish and a real ISO promote. The site has no ISO button yet.) OCI as main, GitHub as mirror, for packages; ISO promote with `SHA256SUMS`. | Download from the public OCI URL and compare the hash to the build's. |
 | 4 | **Signing page.** Encrypted key in a private bucket, password field, manifest signed and published. Decide key reuse versus new key. | A client check (`verify.yml` and the Store) accepts the new manifest; a wrong password signs nothing. |
 | 5 | **Signed packages.** Create a Zohara signing key for pacman, sign the db and packages, move `[zohara-stable]` from `Optional TrustAll` to `Required` through a Store update. | An unsigned package is refused in the test VM. |
 | 6 | **Rollback and record.** `promotions.json`, Rollback button. | Promote A then B, roll back, systems get A again. |
@@ -152,10 +152,17 @@ Phases 0 to 2 fix what is broken today. Phases 3 to 7 are the new features.
 | askama templates and layout, `/health` | open routes (wrap them in the login middleware) |
 | Dockerfile structure (Rust build, small runtime) | runtime image no longer needs `pacman`/`repo-add` once the workflow does the db work |
 
-## Open cleanup (as of 2026-10-02; the owner chose to do these later)
+## Open cleanup (as of 2026-10-04; the owner chose to do these later)
 
 1. **Rotate the GitHub App client secret.** Its value was shown in a chat on 2026-10-01 (a file was named after it). Generate a new
    one on the App page, put it in Render's `ZOHARA_HUB_CLIENT_SECRET`, then delete the old one.
 2. **Delete three local files that hold secrets:** `~/zohara-hub.env`, `~/Documents/zohara-updates-system.2026-10-01.private-key.pem`,
    `~/Documents/ab809e5800174bae45e2d53d62e9815c2abf6343.txt`. (The new App private key itself is not exposed; the old two were deleted on GitHub.)
 3. **Click-test Publish on the live site** with alpha (needs a signed-in browser), then delete the `channel-alpha` release again.
+4. **Finish phase 3 setup** (needs an OCI browser login, about 5 minutes): `oci session authenticate --region ap-mumbai-1
+   --profile-name zohara --tenancy-name zohaibbaig144`, then create the public bucket `zohara-packages`, two pre-authenticated
+   write requests (1 year), and paste each URL into the GitHub secrets named above. Details: `zohara-packages/README.md`
+   ("OCI Object Storage"). Test with an alpha publish, then delete `channel-alpha` and the `channel-alpha/` folder again.
+5. **Still to build:** an ISO promote button on the site (dispatch `iso-promote` with the run id), phase 4 (signing page, key
+   decision), phase 5 (signed packages, `SigLevel = Required`), phase 6 (rollback, `promotions.json`), phase 7 (retire old pieces),
+   switching installed systems' `pacman.conf` to OCI first with GitHub as a second `Server =` line.
