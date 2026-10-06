@@ -152,6 +152,18 @@ Phases 0 to 2 fix what is broken today. Phases 3 to 7 are the new features.
 | askama templates and layout, `/health` | open routes (wrap them in the login middleware) |
 | Dockerfile structure (Rust build, small runtime) | runtime image no longer needs `pacman`/`repo-add` once the workflow does the db work |
 
+## Status 2026-10-06
+
+* Phase 1, 2: done and live. The Publish button was click-tested live (alpha, stable).
+* Phase 3: done and live for packages (OCI buckets and secrets exist; every publish is mirrored and checked against GitHub).
+  The ISO page and Promote ISO button exist (commit `cc7e509`) but **`promote-iso.yml` has never run for real**.
+* Phase 4 (signing page): not built. The manifest key was **re-made** by hand on 2026-10-05 (`E2D2009325647762`, secret at
+  `~/.minisign/zohara.key`), see `zohara/docs/HANDOFF-2026-10-06.md`.
+* Phase 5 (signed packages): started. Key, `zohara-keyring`, signing code and tests exist; signing is off until the owner adds
+  the GitHub secret, and machines still use `Optional TrustAll`. See `zohara-packages/docs/SIGNING.md`.
+* Phase 6, 7: not started. The site lists only `zohara-settings` and `zohara-apps`; the Store, Keyring and other `zohara`-repo
+  packages are published by `gh workflow run publish.yml` (source `Zohaib8090/zohara`).
+
 ## Open cleanup (as of 2026-10-04; the owner chose to do these later)
 
 1. **Rotate the GitHub App client secret.** Its value was shown in a chat on 2026-10-01 (a file was named after it). Generate a new
