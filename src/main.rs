@@ -287,10 +287,10 @@ struct RunRepo {
     full_name: String,
 }
 
-/// Branches whose builds may be published. `main` is the development line; `beta` is for a build that carries only some of
-/// what is on `main` (for example everything except one feature that must stay on alpha), so it can go to any channel
+/// Branches whose builds may be published. `main` is the development line; `beta` and `stable` hold a build that carries only
+/// some of what is on `main` (for example everything except one feature that must stay on alpha); each can go to any channel
 /// on purpose. Keep in step with `scripts/verify-source-run.sh` in zohara-packages.
-const PUBLISHABLE_BRANCHES: [&str; 2] = ["main", "beta"];
+const PUBLISHABLE_BRANCHES: [&str; 3] = ["main", "beta", "stable"];
 
 impl WorkflowRun {
     /// Whether the buttons are offered for this run (the build workflow of a publishable branch, not a publish run).
@@ -299,7 +299,7 @@ impl WorkflowRun {
     }
 }
 
-/// A run may be published only if it is a finished, successful build of the watched repo itself, from `main` or `beta`,
+/// A run may be published only if it is a finished, successful build of the watched repo itself, from `main`, `beta` or `stable`,
 /// started by a push or by hand. This refuses pull-request runs (a fork can run a workflow too), runs on
 /// other branches and runs of any other repository.
 fn run_is_publishable(run: &WorkflowRun, repo_full: &str) -> Result<(), String> {
@@ -307,7 +307,7 @@ fn run_is_publishable(run: &WorkflowRun, repo_full: &str) -> Result<(), String> 
         return Err("that run did not finish successfully".into());
     }
     if !PUBLISHABLE_BRANCHES.contains(&run.head_branch.as_str()) {
-        return Err(format!("that run is from branch `{}`, only `main` and `beta` can be published", run.head_branch));
+        return Err(format!("that run is from branch `{}`, only `main`, `beta` and `stable` can be published", run.head_branch));
     }
     if run.event != "push" && run.event != "workflow_dispatch" {
         return Err(format!("that run was started by `{}`, only push or manual runs can be published", run.event));
@@ -1068,6 +1068,7 @@ mod tests {
     fn good_run_is_publishable() {
         assert!(run_is_publishable(&run("main", "push", "completed", Some("success"), Some(REPO)), REPO).is_ok());
         assert!(run_is_publishable(&run("beta", "push", "completed", Some("success"), Some(REPO)), REPO).is_ok());
+        assert!(run_is_publishable(&run("stable", "push", "completed", Some("success"), Some(REPO)), REPO).is_ok());
         assert!(run_is_publishable(&run("main", "workflow_dispatch", "completed", Some("success"), Some("zohaib8090/ZOHARA-settings")), REPO).is_ok());
     }
 
@@ -1132,6 +1133,8 @@ mod tests {
         r.name = "Build & Publish Zohara Settings".into();
         assert!(r.offered());
         r.head_branch = "beta".into();
+        assert!(r.offered());
+        r.head_branch = "stable".into();
         assert!(r.offered());
         r.head_branch = "feature".into();
         assert!(!r.offered());
