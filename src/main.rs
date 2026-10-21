@@ -287,15 +287,27 @@ struct RunRepo {
     full_name: String,
 }
 
-/// A run may be published only if it is a finished, successful build of the watched repo itself, from its `main`
-/// branch, started by a push or by hand. This refuses pull-request runs (a fork can run a workflow too), runs on
+/// Branches whose builds may be published. `main` is the development line; `beta` is for a build that carries only some of
+/// what is on `main` (for example everything except one feature that must stay on alpha), so it can go to any channel
+/// on purpose. Keep in step with `scripts/verify-source-run.sh` in zohara-packages.
+const PUBLISHABLE_BRANCHES: [&str; 2] = ["main", "beta"];
+
+impl WorkflowRun {
+    /// Whether the buttons are offered for this run (the build workflow of a publishable branch, not a publish run).
+    fn offered(&self) -> bool {
+        PUBLISHABLE_BRANCHES.contains(&self.head_branch.as_str()) && self.name != "Publish to alpha"
+    }
+}
+
+/// A run may be published only if it is a finished, successful build of the watched repo itself, from `main` or `beta`,
+/// started by a push or by hand. This refuses pull-request runs (a fork can run a workflow too), runs on
 /// other branches and runs of any other repository.
 fn run_is_publishable(run: &WorkflowRun, repo_full: &str) -> Result<(), String> {
     if run.status != "completed" || run.conclusion.as_deref() != Some("success") {
         return Err("that run did not finish successfully".into());
     }
-    if run.head_branch != "main" {
-        return Err(format!("that run is from branch `{}`, only `main` can be published", run.head_branch));
+    if !PUBLISHABLE_BRANCHES.contains(&run.head_branch.as_str()) {
+        return Err(format!("that run is from branch `{}`, only `main` and `beta` can be published", run.head_branch));
     }
     if run.event != "push" && run.event != "workflow_dispatch" {
         return Err(format!("that run was started by `{}`, only push or manual runs can be published", run.event));
@@ -503,7 +515,7 @@ async fn repo_view(
     }
     let repo_url = format!("https://api.github.com/repos/{full}");
     let runs_url = format!(
-        "https://api.github.com/repos/{full}/actions/runs?per_page=15&status=success"
+        "https://api.github.com/repos/{full}/actions/runs?per_page=40&status=success"
     );
 
     let repo: RepoInfo = match s.gh.get_json(&repo_url).await {
@@ -1055,6 +1067,7 @@ mod tests {
     #[test]
     fn good_run_is_publishable() {
         assert!(run_is_publishable(&run("main", "push", "completed", Some("success"), Some(REPO)), REPO).is_ok());
+        assert!(run_is_publishable(&run("beta", "push", "completed", Some("success"), Some(REPO)), REPO).is_ok());
         assert!(run_is_publishable(&run("main", "workflow_dispatch", "completed", Some("success"), Some("zohaib8090/ZOHARA-settings")), REPO).is_ok());
     }
 
@@ -1111,5 +1124,19 @@ mod tests {
         if let Ok(dir) = std::env::var("ZHUB_RENDER_DIR") {
             for (n, h) in &pages { std::fs::write(format!("{dir}/{n}.html"), h).unwrap(); }
         }
+    }
+
+    #[test]
+    fn buttons_are_offered_for_builds_of_main_and_beta_only() {
+        let mut r = run("main", "push", "completed", Some("success"), Some(REPO));
+        r.name = "Build & Publish Zohara Settings".into();
+        assert!(r.offered());
+        r.head_branch = "beta".into();
+        assert!(r.offered());
+        r.head_branch = "feature".into();
+        assert!(!r.offered());
+        r.head_branch = "main".into();
+        r.name = "Publish to alpha".into();
+        assert!(!r.offered(), "a publish run has no package to publish");
     }
 }

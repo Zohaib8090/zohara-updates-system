@@ -18,11 +18,12 @@
 {% endif %}
 <div class="rows">
 {% for r in runs %}
+{% if r.offered() %}
   <div class="card row">
     <div class="row-main">
       <div class="row-title"><a href="{{ r.html_url }}">{{ r.display_title }}</a></div>
       <div class="row-meta">
-        <span class="mono">{{ r.head_sha[..7] }}</span> on {{ r.head_branch }} ·
+        <span class="mono">{{ r.head_sha[..7] }}</span> on <strong>{{ r.head_branch }}</strong> ·
         <time datetime="{{ r.created_at }}">{{ r.created_at }}</time> · run #{{ r.id }}
       </div>
     </div>
@@ -38,7 +39,8 @@
       </div>
     </form>
   </div>
+{% endif %}
 {% endfor %}
 </div>
-<p class="muted small">Alpha is for testing, beta for early users, stable reaches every Zohara computer.</p>
+<p class="muted small">Alpha is for testing, beta for early users, stable reaches every Zohara computer. Builds from the <strong>main</strong> and <strong>beta</strong> branches are listed: a beta build can hold only part of what is on main, and can go to any channel.</p>
 {% endblock %}
